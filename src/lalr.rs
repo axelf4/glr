@@ -1,0 +1,555 @@
+/// LALR(1) parser generator.
+///
+/// See: DeRemer, F. L., and T. J. Pennelo: "Efficient Computation of
+///      LALR(1) Lookahead Sets", ACM Transactions on Programming
+///      Languages and Systems, Vol. 4, No. 4, Oct. 1982, pp. 615-649"
+use petgraph::{graph::NodeIndex, visit::EdgeRef as _, Graph};
+use roaring::RoaringBitmap as BitSet;
+use std::cmp::min;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::hash::Hash;
+use std::mem;
+use std::ops;
+
+pub type Symbol = usize;
+
+const EOF: Symbol = u16::MAX as usize;
+
+/// The first nonterminal is the start symbol.
+pub struct Grammar<'a> {
+    num_symbols: usize,
+    nonterminals: &'a [Vec<Vec<Symbol>>],
+}
+
+impl<'a> Grammar<'a> {
+    fn is_non_terminal(&self, symbol: usize) -> bool {
+        symbol < self.nonterminals.len()
+    }
+
+    fn productions_for(&self, nonterminal: usize) -> Option<impl Iterator<Item = Production<'a>>> {
+        self.nonterminals.get(nonterminal).map(|alts| {
+            alts.into_iter().map(move |rhs| Production {
+                lhs: nonterminal,
+                rhs: &rhs,
+            })
+        })
+    }
+
+    fn productions(&'a self) -> impl Iterator<Item = Production<'a>> {
+        (0..self.nonterminals.len()).flat_map(|x| self.productions_for(x).unwrap())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Production<'grammar> {
+    lhs: Symbol,
+    rhs: &'grammar [Symbol],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct Item<'grammar> {
+    production: Production<'grammar>,
+    cursor: usize,
+}
+
+impl<'grammar> Item<'grammar> {
+    /// Returns the symbol to the right of the dot.
+    fn next_symbol(&self) -> Option<Symbol> {
+        self.production.rhs.get(self.cursor).copied()
+    }
+
+    fn shift_symbol(&self) -> Option<(Symbol, Item<'grammar>)> {
+        self.next_symbol().map(|s| {
+            (
+                s,
+                Item {
+                    production: self.production,
+                    cursor: self.cursor + 1,
+                },
+            )
+        })
+    }
+
+    fn is_start(&self) -> bool {
+        self.cursor == 0
+    }
+    fn is_final(&self) -> bool {
+        self.cursor == self.production.rhs.len()
+    }
+}
+
+impl fmt::Display for Item<'_> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        self.production.lhs.fmt(fmt)?;
+        write!(fmt, " →")?;
+        let (before, after) = self.production.rhs.split_at(self.cursor);
+        before.iter().try_for_each(|t| write!(fmt, " {}", t))?;
+        write!(fmt, " •")?;
+        after.iter().try_for_each(|t| write!(fmt, " {}", t))
+    }
+}
+
+#[derive(Debug)]
+struct ItemSet<'grammar>(Vec<Item<'grammar>>);
+
+impl<'grammar> ItemSet<'grammar> {
+    /// Returns the transitive closure of the specified item set.
+    fn closure(mut self, g: &'grammar Grammar<'grammar>) -> Self {
+        let mut set: HashSet<_> = self.0.iter().copied().collect();
+        let mut i = 0;
+        while let Some(&item) = self.0.get(i) {
+            // If the cursor is just left of some nonterminal N
+            match item.next_symbol() {
+                Some(n) if g.is_non_terminal(n) => {
+                    // Add initial items for all N-productions
+                    for production in g.productions_for(n).unwrap() {
+                        let new_item = Item {
+                            production,
+                            cursor: 0,
+                        };
+                        if set.insert(new_item) {
+                            self.0.push(new_item)
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        self
+    }
+}
+
+/// A state is uniquely identified by its "seed" items, i.e. the kernel.
+///
+/// This is because the transitive closure only adds start items,
+/// while the item dots of all kernels other than the first are
+/// advanced.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct Kernel<'grammar>(Vec<Item<'grammar>>);
+
+impl<'grammar> Kernel<'grammar> {
+    fn start(items: Vec<Item<'grammar>>) -> Self {
+        debug_assert!(items.iter().all(Item::is_start));
+        Self(items)
+    }
+
+    fn shifted(items: Vec<Item<'grammar>>) -> Self {
+        debug_assert!(items.iter().all(|i| i.cursor > 0));
+        Self(items)
+    }
+}
+
+impl<'grammar> From<Kernel<'grammar>> for ItemSet<'grammar> {
+    fn from(x: Kernel<'grammar>) -> Self {
+        Self(x.0)
+    }
+}
+
+#[derive(Debug)]
+struct State<'grammar> {
+    item_set: ItemSet<'grammar>,
+}
+
+struct Lr0Dfa<'grammar> {
+    states: Graph<State<'grammar>, Symbol>,
+}
+
+impl<'grammar> Lr0Dfa<'grammar> {
+    /// Constructs the LR(0) DFA.
+    fn new(g: &'grammar Grammar) -> Self {
+        let mut states = Graph::new();
+        // Augment the grammar with a production `S' → S`, where `S` is the start symbol.
+        // To generate the initial item set, take the closure of the item `S' → •S`.
+        let production0 = Production {
+            lhs: usize::MAX,
+            rhs: &[0, EOF],
+        };
+        let kernel0 = Kernel::start(vec![Item {
+            production: production0,
+            cursor: 0,
+        }]);
+        let state0 = states.add_node(State {
+            item_set: ItemSet::from(kernel0.clone()).closure(g),
+        });
+        let mut kernel_set: HashMap<Kernel, NodeIndex> = HashMap::new();
+        kernel_set.insert(kernel0, state0);
+        let mut stack = vec![state0];
+        while let Some(n) = stack.pop() {
+            // All transitions on shifted symbols from this state
+            let mut goto_sets: HashMap<_, Vec<_>> = HashMap::new();
+            for (symbol, item) in states[n].item_set.0.iter().filter_map(Item::shift_symbol) {
+                goto_sets.entry(symbol).or_default().push(item);
+            }
+
+            for (x, goto_set) in goto_sets {
+                // The goto_set:s remain sorted here, because
+                // transitive closure and shifting preserve order.
+                // Therefore kernels may be compared as lists instead
+                // of as sets.
+                let m = *kernel_set
+                    .entry(Kernel::shifted(goto_set))
+                    .or_insert_with_key(|kernel| {
+                        let new_state = states.add_node(State {
+                            item_set: ItemSet::from(kernel.clone()).closure(g),
+                        });
+                        stack.push(new_state);
+                        new_state
+                    });
+
+                // Add an edge X from current state to Goto(I, X) state
+                states.add_edge(n, m, x);
+            }
+        }
+
+        Self { states }
+    }
+}
+
+/// The Digraph algorithm.
+///
+/// Takes `R`, a relation on `X`, and `F'`, a function from `X` to
+/// sets, and outputs `F`, a function from `X` to sets, such that `F
+/// x` satisfies
+///
+///     F x =s F' x ∪ ⋃{F y | xRy}
+fn digraph<T, R, I, Fp>(xs: &[T], r: R, mut fp: Fp) -> Vec<BitSet>
+where
+    R: Fn(usize) -> I,
+    I: IntoIterator<Item = usize>,
+    Fp: FnMut(usize) -> BitSet,
+{
+    // Let G = (X, R) be the digraph induced by R, such as
+    //
+    //         (a)
+    //        /  ^                               {a,b,c}  {e}
+    //       v    \                               |   \   /
+    //     (b)--->(c)   (e)  reduces to the DAG   v    v v
+    //            / \   /                        {f}   {d}
+    //           v   v v
+    //         (f)   (d)
+    //
+    // For the graph G' on the right where all strongly connected
+    // components have been collapsed, each leaf x has no y such that
+    // xRy; F x is simply F' x, and for a nonleaf x, F x is F' x
+    // unioned with the F-values of its children. Thus standard
+    // tree-traversal would work.
+    //
+    // The following is therefore an adapted algorithm for finding
+    // SCC:s that computes F without explicitly constructing G'.
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Mark {
+        Unmarked,
+        Active(usize),
+        FoundScc,
+    }
+    use Mark::*;
+
+    let mut stack = Vec::new();
+    let mut f = xs.iter().map(|_| Default::default()).collect();
+    let mut n = vec![Unmarked; xs.len()];
+
+    for (x, _) in xs.into_iter().enumerate() {
+        traverse(xs, &r, &mut fp, &mut stack, &mut f, &mut n, x);
+    }
+
+    fn traverse<T, R, I, Fp>(
+        xs: &[T],
+        r: &R,
+        fp: &mut Fp,
+        stack: &mut Vec<usize>,
+        f: &mut Vec<BitSet>,
+        n: &mut Vec<Mark>,
+        x: usize,
+    ) where
+        R: Fn(usize) -> I,
+        I: IntoIterator<Item = usize>,
+        Fp: FnMut(usize) -> BitSet,
+    {
+        if n[x] != Unmarked {
+            return;
+        }
+        stack.push(x);
+        let depth = stack.len();
+        n[x] = Active(depth);
+        f[x] = fp(x);
+
+        for y in r(x).into_iter() {
+            if y == x {
+                continue;
+            }
+
+            traverse(xs, r, fp, stack, f, n, y);
+            n[x] = min(n[x], n[y]);
+
+            if let (a, [fy, b @ ..]) = f.split_at_mut(y) {
+                let fx = if x < y { &mut a[x] } else { &mut b[x - y - 1] };
+                *fx |= &*fy;
+            } else {
+                unreachable!()
+            }
+        }
+
+        if n[x] == Active(depth) {
+            loop {
+                let z = stack.pop().unwrap();
+                if z == x {
+                    break;
+                } else {
+                    n[z] = FoundScc;
+                    f[z] = f[x].clone();
+                }
+            }
+        }
+    }
+
+    f
+}
+
+type StateId = usize;
+
+pub enum Action<'grammar> {
+    Shift { goto: StateId },
+    Reduce { production: Production<'grammar> },
+    Accept,
+}
+
+/// LALR(1) parse table.
+pub struct Table<'grammar> {
+    num_symbols: usize,
+    table: Vec<Vec<Action<'grammar>>>,
+}
+
+impl<'grammar> ops::Index<(StateId, Symbol)> for Table<'grammar> {
+    type Output = Vec<Action<'grammar>>;
+    fn index(&self, (i, symbol): (StateId, Symbol)) -> &Self::Output {
+        &self.table[self.num_symbols * i + symbol]
+    }
+}
+
+impl<'grammar> ops::IndexMut<(StateId, Symbol)> for Table<'grammar> {
+    fn index_mut(&mut self, (i, symbol): (StateId, Symbol)) -> &mut Self::Output {
+        &mut self.table[self.num_symbols * i + symbol]
+    }
+}
+
+impl<'grammar> Table<'grammar> {
+    pub fn new(g: &'grammar Grammar) -> Self {
+        // Build the LALR(1) lookahead sets from the LR(0) automata
+        let Lr0Dfa { states, .. } = Lr0Dfa::new(g);
+
+        let nullable = {
+            let mut set = HashSet::new();
+            // Simple O(n^2) fixpoint algorithm
+            loop {
+                let mut finished = true;
+                for production in g.productions() {
+                    if !set.contains(&production.lhs)
+                        && production.rhs.iter().all(|x| set.contains(x))
+                    {
+                        set.insert(production.lhs);
+                        finished = false;
+                    }
+                }
+                if finished {
+                    break;
+                }
+            }
+
+            move |x: &Symbol| set.contains(x)
+        };
+
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        struct Transition {
+            state: NodeIndex,
+            symbol: Symbol,
+        }
+
+        // The set of nonterminal transitions of the LR(0) parser
+        let xs: Vec<Transition> = states
+            .node_indices()
+            .flat_map(|state| {
+                states
+                    .edges(state)
+                    .map(|e| *e.weight())
+                    .filter(|&s| g.is_non_terminal(s))
+                    .map(move |symbol| Transition { state, symbol })
+            })
+            .collect();
+        let xs_index: HashMap<Transition, usize> = xs
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, trans)| (trans, i))
+            .collect();
+
+        // Returns direct read symbols
+        let dr = |Transition {
+                      state: p,
+                      symbol: a,
+                  }| {
+            states
+                .edges(states.edges(p).find(|e| *e.weight() == a).unwrap().target())
+                .map(|e| *e.weight())
+        };
+
+        // (p, A) READS (r, C) iff p --A-> r --C-> and C =>* eps
+        let reads = |Transition {
+                         state: p,
+                         symbol: a,
+                     }| {
+            let r = states.edges(p).find(|e| *e.weight() == a).unwrap().target();
+            states
+                .edges(r)
+                .map(|e| *e.weight())
+                .filter(&nullable)
+                .map(move |c| Transition {
+                    state: r,
+                    symbol: c,
+                })
+        };
+
+        // (p, A) INCLUDES (p', B) iff B -> L A T,  T =>* eps, and p' --L-> p
+        let mut includes: Vec<_> = xs.iter().map(|_| HashSet::new()).collect();
+        // (q, A -> w) LOOKBACK (p, A) iff p --w-> q
+        let mut lookback: HashMap<(NodeIndex, Production), HashSet<usize>> = HashMap::new();
+        for (i, &Transition { state, symbol: b }) in xs.iter().enumerate() {
+            // Consider start B-items
+            for item in states[state]
+                .item_set
+                .0
+                .iter()
+                .filter(|item| item.production.lhs == b && item.is_start())
+            {
+                // Run the state machine forward
+                let mut j = state;
+                for (cursor, t) in item.production.rhs[item.cursor..]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, &t)| (item.cursor + i, t))
+                {
+                    if cursor > 0 {
+                        // If this (symbol, state) is a nonterminal transition
+                        if let Some(&trans) = xs_index.get(&Transition {
+                            state: j,
+                            symbol: t,
+                        }) {
+                            if item.production.rhs[item.cursor..][1..]
+                                .into_iter()
+                                .all(&nullable)
+                            {
+                                includes[trans].insert(i);
+                            }
+                        }
+                    }
+
+                    j = states.edges(j).find(|e| *e.weight() == t).unwrap().target();
+                }
+                // At this point j is the final state
+                lookback.entry((j, item.production)).or_default().insert(i);
+            }
+        }
+
+        let mut read = digraph(
+            &xs,
+            |x| reads(xs[x]).map(|x| xs_index[&x]),
+            |x| dr(xs[x]).map(|x| x as u32).collect(),
+        );
+        let follow = digraph(
+            &xs,
+            |x| includes[x].iter().copied(),
+            // Reuse set since digraph calls F' on each element of X only once
+            |x| mem::take(&mut read[x]),
+        );
+
+        // LA(q, A -> w) = U{Follow(p, A) | (q, A -> w) lookback (p, A)}
+        let la = |q, production| {
+            lookback[&(q, production)]
+                .iter()
+                .flat_map(|&transition| &follow[transition])
+                .map(|x| x as usize)
+        };
+
+        // Build the parse table
+        let mut table = Table {
+            num_symbols: g.num_symbols + 1,
+            table: (0..states.node_count() * (g.num_symbols + 1))
+                .into_iter()
+                .map(|_| Vec::new())
+                .collect(),
+        };
+        for i in states.node_indices() {
+            let state = &states[i];
+            println!("State {:?}: {:?}", i, &state);
+
+            for e in states.edges(i) {
+                let symbol = *e.weight();
+                let symbol = if symbol == EOF { g.num_symbols } else { symbol };
+                let actions = &mut table[(e.source().index(), symbol)];
+                actions.push(Action::Shift {
+                    goto: e.target().index(),
+                });
+            }
+
+            // Given a final A-item for production P (A != S'), fill
+            // corresponding row with reduce action for P.
+            for item in state
+                .item_set
+                .0
+                .iter()
+                .filter(|item| item.is_final() && item.production.lhs != usize::MAX)
+            {
+                for s in la(i, item.production) {
+                    let s = if s == EOF { g.num_symbols } else { s };
+                    let actions = &mut table[(i.index(), s)];
+                    // Check for ambiguous grammar
+                    if !actions.is_empty() {
+                        println!("Shift/reduce or reduce/reduce conflict!");
+                    }
+                    println!("In state {:?} reduce item {} on {}", i, item, s);
+                    actions.push(Action::Reduce {
+                        production: item.production,
+                    });
+                }
+            }
+        }
+
+        table
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display_item() {
+        assert_eq!(
+            format!(
+                "{}",
+                Item {
+                    production: Production {
+                        lhs: 1,
+                        rhs: &[1, 2]
+                    },
+                    cursor: 1
+                }
+            ),
+            "1 → 1 • 2"
+        );
+    }
+
+    #[test]
+    fn test_build_lr0_automata() {
+        let nonterminals = &[vec![vec![0, 1], Vec::new()]];
+        let grammar = Grammar {
+            num_symbols: 2,
+            nonterminals,
+        };
+        let table = Table::new(&grammar);
+
+        assert!(false);
+    }
+}
