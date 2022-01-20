@@ -14,16 +14,17 @@ use std::ops;
 
 pub type Symbol = usize;
 
+const S_PRIME: Symbol = usize::MAX;
 const EOF: Symbol = u16::MAX as usize;
 
 /// The first nonterminal is the start symbol.
 pub struct Grammar<'a> {
-    num_symbols: usize,
-    nonterminals: &'a [Vec<Vec<Symbol>>],
+    pub num_symbols: usize,
+    pub nonterminals: &'a [Vec<Vec<Symbol>>],
 }
 
 impl<'a> Grammar<'a> {
-    fn is_non_terminal(&self, symbol: usize) -> bool {
+    fn is_nonterminal(&self, symbol: usize) -> bool {
         symbol < self.nonterminals.len()
     }
 
@@ -43,8 +44,8 @@ impl<'a> Grammar<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Production<'grammar> {
-    lhs: Symbol,
-    rhs: &'grammar [Symbol],
+    pub lhs: Symbol,
+    pub rhs: &'grammar [Symbol],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -74,9 +75,6 @@ impl<'grammar> Item<'grammar> {
     fn is_start(&self) -> bool {
         self.cursor == 0
     }
-    fn is_final(&self) -> bool {
-        self.cursor == self.production.rhs.len()
-    }
 }
 
 impl fmt::Display for Item<'_> {
@@ -101,7 +99,7 @@ impl<'grammar> ItemSet<'grammar> {
         while let Some(&item) = self.0.get(i) {
             // If the cursor is just left of some nonterminal N
             match item.next_symbol() {
-                Some(n) if g.is_non_terminal(n) => {
+                Some(n) if g.is_nonterminal(n) => {
                     // Add initial items for all N-productions
                     for production in g.productions_for(n).unwrap() {
                         let new_item = Item {
@@ -163,7 +161,7 @@ impl<'grammar> Lr0Dfa<'grammar> {
         // Augment the grammar with a production `S' → S`, where `S` is the start symbol.
         // To generate the initial item set, take the closure of the item `S' → •S`.
         let production0 = Production {
-            lhs: usize::MAX,
+            lhs: S_PRIME,
             rhs: &[0, EOF],
         };
         let kernel0 = Kernel::start(vec![Item {
@@ -308,15 +306,22 @@ where
     f
 }
 
-type StateId = usize;
+pub type StateId = usize;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action<'grammar> {
-    Shift { goto: StateId },
-    Reduce { production: Production<'grammar> },
+    Shift {
+        goto: StateId,
+    },
+    Reduce {
+        production: Production<'grammar>,
+        count: usize,
+    },
     Accept,
 }
 
 /// LALR(1) parse table.
+#[derive(Debug)]
 pub struct Table<'grammar> {
     num_symbols: usize,
     table: Vec<Vec<Action<'grammar>>>,
@@ -325,12 +330,14 @@ pub struct Table<'grammar> {
 impl<'grammar> ops::Index<(StateId, Symbol)> for Table<'grammar> {
     type Output = Vec<Action<'grammar>>;
     fn index(&self, (i, symbol): (StateId, Symbol)) -> &Self::Output {
+        debug_assert!(symbol < self.num_symbols);
         &self.table[self.num_symbols * i + symbol]
     }
 }
 
 impl<'grammar> ops::IndexMut<(StateId, Symbol)> for Table<'grammar> {
     fn index_mut(&mut self, (i, symbol): (StateId, Symbol)) -> &mut Self::Output {
+        debug_assert!(symbol < self.num_symbols);
         &mut self.table[self.num_symbols * i + symbol]
     }
 }
@@ -374,7 +381,7 @@ impl<'grammar> Table<'grammar> {
                 states
                     .edges(state)
                     .map(|e| *e.weight())
-                    .filter(|&s| g.is_non_terminal(s))
+                    .filter(|&s| g.is_nonterminal(s))
                     .map(move |symbol| Transition { state, symbol })
             })
             .collect();
@@ -393,6 +400,7 @@ impl<'grammar> Table<'grammar> {
             states
                 .edges(states.edges(p).find(|e| *e.weight() == a).unwrap().target())
                 .map(|e| *e.weight())
+                .filter(|&x| !g.is_nonterminal(x))
         };
 
         // (p, A) READS (r, C) iff p --A-> r --C-> and C =>* eps
@@ -425,10 +433,12 @@ impl<'grammar> Table<'grammar> {
             {
                 // Run the state machine forward
                 let mut j = state;
-                for (cursor, t) in item.production.rhs[item.cursor..]
+                for (cursor, &t) in item
+                    .production
+                    .rhs
                     .into_iter()
                     .enumerate()
-                    .map(|(i, &t)| (item.cursor + i, t))
+                    .skip(item.cursor)
                 {
                     if cursor > 0 {
                         // If this (symbol, state) is a nonterminal transition
@@ -436,13 +446,15 @@ impl<'grammar> Table<'grammar> {
                             state: j,
                             symbol: t,
                         }) {
-                            if item.production.rhs[item.cursor..][1..]
-                                .into_iter()
-                                .all(&nullable)
-                            {
+                            if item.production.rhs[cursor + 1..].into_iter().all(&nullable) {
                                 includes[trans].insert(i);
                             }
                         }
+                    }
+
+                    // Deviate from algorithm to include right nulled (RN) rules
+                    if item.production.rhs[cursor..].into_iter().all(&nullable) {
+                        lookback.entry((j, item.production)).or_default().insert(i);
                     }
 
                     j = states.edges(j).find(|e| *e.weight() == t).unwrap().target();
@@ -466,13 +478,19 @@ impl<'grammar> Table<'grammar> {
 
         // LA(q, A -> w) = U{Follow(p, A) | (q, A -> w) lookback (p, A)}
         let la = |q, production| {
-            lookback[&(q, production)]
-                .iter()
-                .flat_map(|&transition| &follow[transition])
-                .map(|x| x as usize)
+            lookback
+                .get(&(q, production))
+                .into_iter()
+                .flat_map(|transitions| {
+                    transitions
+                        .iter()
+                        .flat_map(|&transition| &follow[transition])
+                        .map(|x| x as Symbol)
+                })
         };
 
         // Build the parse table
+        let eof = g.num_symbols;
         let mut table = Table {
             num_symbols: g.num_symbols + 1,
             table: (0..states.node_count() * (g.num_symbols + 1))
@@ -482,11 +500,13 @@ impl<'grammar> Table<'grammar> {
         };
         for i in states.node_indices() {
             let state = &states[i];
-            println!("State {:?}: {:?}", i, &state);
+            println!("State {}: {:?}", i.index(), &state);
 
             for e in states.edges(i) {
                 let symbol = *e.weight();
-                let symbol = if symbol == EOF { g.num_symbols } else { symbol };
+                if symbol == EOF {
+                    continue;
+                }
                 let actions = &mut table[(e.source().index(), symbol)];
                 actions.push(Action::Shift {
                     goto: e.target().index(),
@@ -499,21 +519,42 @@ impl<'grammar> Table<'grammar> {
                 .item_set
                 .0
                 .iter()
-                .filter(|item| item.is_final() && item.production.lhs != usize::MAX)
+                .filter(|item| item.production.lhs != S_PRIME)
             {
+                println!("\tConsidering state: {}, item: {}", i.index(), item);
                 for s in la(i, item.production) {
-                    let s = if s == EOF { g.num_symbols } else { s };
+                    let s = if s == EOF { eof } else { s };
+
                     let actions = &mut table[(i.index(), s)];
+                    println!("In state {} reduce item {} on {}", i.index(), item, s);
                     // Check for ambiguous grammar
                     if !actions.is_empty() {
                         println!("Shift/reduce or reduce/reduce conflict!");
                     }
-                    println!("In state {:?} reduce item {} on {}", i, item, s);
-                    actions.push(Action::Reduce {
+                    let new_action = Action::Reduce {
                         production: item.production,
-                    });
+                        count: item.cursor,
+                    };
+                    if !actions.contains(&new_action) {
+                        actions.push(new_action);
+                    }
                 }
             }
+
+            // For every state containing S' → w•eof, set accept in eof column
+            if state
+                .item_set
+                .0
+                .iter()
+                .any(|item| item.production.lhs == S_PRIME && item.next_symbol() == Some(EOF))
+            {
+                table[(i.index(), eof)].push(Action::Accept);
+            }
+        }
+
+        // If S ⇒* ε, set accept in eof column in the start state.
+        if nullable(&0) {
+            table[(0, eof)].push(Action::Accept);
         }
 
         table
@@ -548,7 +589,7 @@ mod tests {
             num_symbols: 2,
             nonterminals,
         };
-        let table = Table::new(&grammar);
+        let _table = Table::new(&grammar);
 
         assert!(false);
     }

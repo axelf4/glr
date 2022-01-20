@@ -6,5 +6,5 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-petgraph = "0.6.0"
+petgraph = { version = "0.6.0", default-features = false }
 roaring = "0.8.1"
