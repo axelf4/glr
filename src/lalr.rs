@@ -1,8 +1,10 @@
-/// LALR(1) parser generator.
-///
-/// See: DeRemer, F. L., and T. J. Pennelo: "Efficient Computation of
-///      LALR(1) Lookahead Sets", ACM Transactions on Programming
-///      Languages and Systems, Vol. 4, No. 4, Oct. 1982, pp. 615-649"
+/*!
+LALR(1) parser generator.
+
+See: DEREMER, Frank; PENNELLO, Thomas. Efficient computation of
+     LALR (1) look-ahead sets. ACM Transactions on Programming
+     Languages and Systems (TOPLAS), 1982, 4.4: 615-649.
+*/
 use petgraph::{graph::NodeIndex, visit::EdgeRef as _, Graph};
 use roaring::RoaringBitmap as BitSet;
 use std::cmp::min;
@@ -12,14 +14,19 @@ use std::hash::Hash;
 use std::mem;
 use std::ops;
 
+/// Index of a language symbol.
 pub type Symbol = u16;
 
 const S_PRIME: Symbol = u16::MAX - 1;
 const EOF: Symbol = u16::MAX;
 
-/// The first nonterminal is the start symbol.
+/// Context-free grammar.
 pub struct Grammar<'a> {
+    /// The total number of symbols.
     pub num_symbols: usize,
+    /// Lists of productions for each nonterminal symbol of the grammar.
+    ///
+    /// The first nonterminal is the start symbol.
     pub nonterminals: &'a [Vec<Vec<Symbol>>],
 }
 
@@ -30,9 +37,9 @@ impl<'a> Grammar<'a> {
 
     fn productions_for(&self, nonterminal: Symbol) -> Option<impl Iterator<Item = Production<'a>>> {
         self.nonterminals.get(nonterminal as usize).map(|alts| {
-            alts.into_iter().map(move |rhs| Production {
+            alts.iter().map(move |rhs| Production {
                 lhs: nonterminal,
-                rhs: &rhs,
+                rhs,
             })
         })
     }
@@ -211,14 +218,16 @@ impl<'grammar> Lr0Dfa<'grammar> {
 /// sets, and outputs `F`, a function from `X` to sets, such that `F
 /// x` satisfies
 ///
-///     F x =s F' x ∪ ⋃{F y | xRy}
+/// ```text
+/// F x =s F' x ∪ ⋃{F y | xRy}
+/// ```
 fn digraph<T, R, I, Fp>(xs: &[T], r: R, mut fp: Fp) -> Vec<BitSet>
 where
     R: Fn(usize) -> I,
     I: IntoIterator<Item = usize>,
     Fp: FnMut(usize) -> BitSet,
 {
-    // Let G = (X, R) be the digraph induced by R, such as
+    // Let G = (X, R) be the digraph induced by R, for example
     //
     //         (a)
     //        /  ^                               {a,b,c}  {e}
@@ -249,7 +258,7 @@ where
     let mut f = xs.iter().map(|_| Default::default()).collect();
     let mut n = vec![Unmarked; xs.len()];
 
-    for (x, _) in xs.into_iter().enumerate() {
+    for (x, _) in xs.iter().enumerate() {
         traverse(xs, &r, &mut fp, &mut stack, &mut f, &mut n, x);
     }
 
@@ -306,8 +315,12 @@ where
     f
 }
 
+/// LR state index.
 pub type StateId = usize;
+/// The index of the LR parser start state.
+pub const START_STATE: StateId = 0;
 
+/// LR parse action.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action<'grammar> {
     Shift {
@@ -343,10 +356,15 @@ impl<'grammar> ops::IndexMut<(StateId, Symbol)> for Table<'grammar> {
 }
 
 impl<'grammar> Table<'grammar> {
+    /// Builds a new parse table from the given grammar.
     pub fn new(g: &'grammar Grammar) -> Self {
-        // Build the LALR(1) lookahead sets from the LR(0) automata
+        debug_assert!(
+            g.num_symbols < u16::MAX.into(),
+            "Symbol indices are too large."
+        );
         let Lr0Dfa { states, .. } = Lr0Dfa::new(g);
 
+        // Build the LALR(1) lookahead sets from the LR(0) automata
         let nullable = {
             let mut set = HashSet::new();
             // Simple O(n^2) fixpoint algorithm
@@ -420,7 +438,7 @@ impl<'grammar> Table<'grammar> {
         };
 
         // (p, A) INCLUDES (p', B) iff B -> L A T,  T =>* eps, and p' --L-> p
-        let mut includes: Vec<_> = xs.iter().map(|_| HashSet::new()).collect();
+        let mut includes: Vec<_> = xs.iter().map(|_| BitSet::new()).collect();
         // (q, A -> w) LOOKBACK (p, A) iff p --w-> q
         let mut lookback: HashMap<(NodeIndex, Production), HashSet<usize>> = HashMap::new();
         for (i, &Transition { state, symbol: b }) in xs.iter().enumerate() {
@@ -433,27 +451,21 @@ impl<'grammar> Table<'grammar> {
             {
                 // Run the state machine forward
                 let mut j = state;
-                for (cursor, &t) in item
-                    .production
-                    .rhs
-                    .into_iter()
-                    .enumerate()
-                    .skip(item.cursor)
-                {
+                for (cursor, &t) in item.production.rhs.iter().enumerate().skip(item.cursor) {
                     if cursor > 0 {
                         // If this (symbol, state) is a nonterminal transition
                         if let Some(&trans) = xs_index.get(&Transition {
                             state: j,
                             symbol: t,
                         }) {
-                            if item.production.rhs[cursor + 1..].into_iter().all(&nullable) {
-                                includes[trans].insert(i);
+                            if item.production.rhs[cursor + 1..].iter().all(&nullable) {
+                                includes[trans].insert(i as u32);
                             }
                         }
                     }
 
                     // Deviate from algorithm to include right nulled (RN) rules
-                    if item.production.rhs[cursor..].into_iter().all(&nullable) {
+                    if item.production.rhs[cursor..].iter().all(&nullable) {
                         lookback.entry((j, item.production)).or_default().insert(i);
                     }
 
@@ -471,7 +483,7 @@ impl<'grammar> Table<'grammar> {
         );
         let follow = digraph(
             &xs,
-            |x| includes[x].iter().copied(),
+            |x| includes[x].iter().map(|x| x as usize),
             // Reuse set since digraph calls F' on each element of X only once
             |x| mem::take(&mut read[x]),
         );
@@ -500,7 +512,6 @@ impl<'grammar> Table<'grammar> {
         };
         for i in states.node_indices() {
             let state = &states[i];
-            println!("State {}: {:?}", i.index(), &state);
 
             for e in states.edges(i) {
                 let symbol = *e.weight();
@@ -521,16 +532,10 @@ impl<'grammar> Table<'grammar> {
                 .iter()
                 .filter(|item| item.production.lhs != S_PRIME)
             {
-                println!("\tConsidering state: {}, item: {}", i.index(), item);
                 for s in la(i, item.production) {
                     let s = if s == EOF { eof } else { s };
 
                     let actions = &mut table[(i.index(), s)];
-                    println!("In state {} reduce item {} on {}", i.index(), item, s);
-                    // Check for ambiguous grammar
-                    if !actions.is_empty() {
-                        println!("Shift/reduce or reduce/reduce conflict!");
-                    }
                     let new_action = Action::Reduce {
                         production: item.production,
                         count: item.cursor,
@@ -554,7 +559,7 @@ impl<'grammar> Table<'grammar> {
 
         // If S ⇒* ε, set accept in eof column in the start state.
         if nullable(&0) {
-            table[(0, eof)].push(Action::Accept);
+            table[(START_STATE, eof)].push(Action::Accept);
         }
 
         table
@@ -589,8 +594,13 @@ mod tests {
             num_symbols: 2,
             nonterminals,
         };
-        let _table = Table::new(&grammar);
-
-        assert!(false);
+        let table = Table::new(&grammar);
+        assert_eq!(
+            table[(START_STATE, 1)],
+            &[Action::Reduce {
+                production: Production { lhs: 0, rhs: &[] },
+                count: 0
+            }]
+        );
     }
 }

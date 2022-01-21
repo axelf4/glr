@@ -1,9 +1,13 @@
 [package]
 name = "glr"
 version = "0.1.0"
+authors = ["Axel Forsman <axelsfor@gmail.com>"]
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "RNGLR parser generator"
+homepage = "https://github.com/axelf4/glr"
+repository = "https://github.com/axelf4/glr"
+keywords = ["parser", "LR", "grammar"]
+categories = ["parsing"]
 
 [dependencies]
 petgraph = { version = "0.6.0", default-features = false }

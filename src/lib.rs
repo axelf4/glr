@@ -1,4 +1,47 @@
-/// Right nulled GLR parser (RNGLR).
+/*!
+Right nulled GLR (RNGLR) parser.
+
+# Example
+
+This example shows building a parser for the grammar
+
+```text
+S → S S
+S → a
+S → ε
+```
+
+and using it to parse the input string `a`:
+
+```rust
+use glr::{Parser, lalr::{self, Grammar}};
+let grammar = Grammar {
+    num_symbols: 2,
+    nonterminals: &[vec![vec![0, 0], vec![1], Vec::new()]],
+};
+let table = lalr::Table::new(&grammar);
+let (sppf, root) = Parser::new(&grammar, &table).parse([1]).ok_or("Failed to parse")?;
+
+// The family of the root node is three alternative lists of children
+let family: Vec<_> = root.family(&sppf).collect();
+// Either a single `a`;
+assert_eq!(family[0][0].symbol(&sppf), Ok(1));
+// left-recursion; or
+assert_eq!(family[1][0], root);
+assert_eq!(family[1][1].symbol(&sppf), Err(&[0][..]));
+// right recursion.
+assert_eq!(family[2][0].symbol(&sppf), Ok(0));
+assert_eq!(family[2][1], root);
+# Ok::<(), &'static str>(())
+```
+
+Any one of the infinitely many derivation trees can be recovered by
+unwinding the cycles the right number of times.
+
+See: SCOTT, Elizabeth; JOHNSTONE, Adrian. Right nulled GLR
+     parsers. ACM Transactions on Programming Languages and
+     Systems (TOPLAS), 2006, 28.4: 577-618.
+*/
 use petgraph::{
     graph::{self, EdgeIndex, NodeIndex},
     Graph,
@@ -8,7 +51,7 @@ use std::iter;
 
 pub mod lalr;
 
-use lalr::Symbol;
+use lalr::{Symbol, START_STATE};
 
 #[derive(Clone, Debug)]
 struct SppfNodeData<'grammar> {
@@ -17,19 +60,48 @@ struct SppfNodeData<'grammar> {
     family: Vec<Vec<SppfNode<'grammar>>>,
 }
 
+/// A sub-tree in the SPPF.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SppfNode<'grammar> {
     Idx(usize),
-    Leaf { symbol: Symbol },
+    Leaf {
+        symbol: Symbol,
+    },
+    /// ε-SPPF for the given required nullable part.
     Null(&'grammar [Symbol]),
 }
 
 impl<'grammar> SppfNode<'grammar> {
+    fn data<'a>(&self, sppf: &'a Sppf<'grammar>) -> Option<&'a SppfNodeData<'grammar>> {
+        match *self {
+            SppfNode::Idx(i) => Some(&sppf.nodes[i]),
+            SppfNode::Leaf { .. } | SppfNode::Null(_) => None,
+        }
+    }
+
     fn data_mut<'a>(&self, sppf: &'a mut Sppf<'grammar>) -> Option<&'a mut SppfNodeData<'grammar>> {
         match *self {
             SppfNode::Idx(i) => Some(&mut sppf.nodes[i]),
             SppfNode::Leaf { .. } | SppfNode::Null(_) => None,
         }
+    }
+
+    pub fn symbol(&self, sppf: &Sppf<'grammar>) -> Result<Symbol, &'grammar [Symbol]> {
+        match *self {
+            SppfNode::Idx(_) => Ok(self.data(sppf).unwrap().symbol),
+            SppfNode::Leaf { symbol } => Ok(symbol),
+            SppfNode::Null(xs) => Err(xs),
+        }
+    }
+
+    pub fn family<'a>(
+        &self,
+        sppf: &'a Sppf<'grammar>,
+    ) -> impl Iterator<Item = &'a [SppfNode<'grammar>]> {
+        self.data(sppf)
+            .map(|data| data.family.iter())
+            .unwrap_or_else(|| [].iter())
+            .map(AsRef::as_ref)
     }
 }
 
@@ -123,12 +195,10 @@ impl<Ix> WalkPaths<Ix> {
                     last_edge: edge,
                     last_node: node,
                 });
+            } else if let Some((edge, next)) = iter.next(g) {
+                stack.push((Some(edge), next, g.neighbors(next).detach()));
             } else {
-                if let Some((edge, next)) = iter.next(&g) {
-                    stack.push((Some(edge), next, g.neighbors(next).detach()));
-                } else {
-                    stack.pop(); // Exhausted iterator
-                }
+                stack.pop(); // Exhausted iterator
             }
         }
         None
@@ -165,6 +235,7 @@ impl<'grammar> Gss<'grammar> {
 /// Pending reduction.
 #[derive(Debug)]
 struct Reduction<'grammar> {
+    /// The GSS node from which the reduction is to be applied.
     node: NodeIndex,
     production: lalr::Production<'grammar>,
     /// The number of items to pop off the stack.
@@ -183,9 +254,10 @@ struct Shift {
     goto: lalr::StateId,
 }
 
+/// GLR parser.
 pub struct Parser<'grammar> {
     grammar: &'grammar lalr::Grammar<'grammar>,
-    table: lalr::Table<'grammar>,
+    table: &'grammar lalr::Table<'grammar>,
     gss: Gss<'grammar>,
     /// The queue of reduction operations.
     reductions: Vec<Reduction<'grammar>>,
@@ -196,8 +268,10 @@ pub struct Parser<'grammar> {
 }
 
 impl<'grammar> Parser<'grammar> {
-    pub fn new(grammar: &'grammar lalr::Grammar<'grammar>) -> Self {
-        let table = lalr::Table::new(grammar);
+    pub fn new(
+        grammar: &'grammar lalr::Grammar<'grammar>,
+        table: &'grammar lalr::Table<'grammar>,
+    ) -> Self {
         let gss = Gss::new();
         let reductions = Vec::new();
         let shifts = Vec::new();
@@ -218,7 +292,6 @@ impl<'grammar> Parser<'grammar> {
         mut self,
         input: impl IntoIterator<Item = Symbol>,
     ) -> Option<(Sppf<'grammar>, SppfNode<'grammar>)> {
-        const START_STATE: lalr::StateId = 0;
         let eof = self.grammar.num_symbols as Symbol;
         let mut input = input.into_iter().chain(iter::once(eof));
 
@@ -238,7 +311,7 @@ impl<'grammar> Parser<'grammar> {
                     node: v0,
                     production,
                     count: 0,
-                    sppf_node: SppfNode::Null(production.rhs),
+                    sppf_node: SppfNode::Null(&[]),
                 }),
                 lalr::Action::Accept => return Some((self.sppf, SppfNode::Null(&[0]))),
                 _ => {}
@@ -308,8 +381,10 @@ impl<'grammar> Parser<'grammar> {
                 })
                 .unwrap();
 
-            let z = if m == 0 {
-                SppfNode::Null(production.rhs)
+            let z = if production.rhs.is_empty() {
+                SppfNode::Leaf {
+                    symbol: production.lhs,
+                }
             } else {
                 *self
                     .recent_sppf_nodes
@@ -322,11 +397,26 @@ impl<'grammar> Parser<'grammar> {
 
             // Push a new node w
             if let Some(&w) = self.gss.head.get(&l) {
-                if self.gss.g.find_edge(w, u).is_some() {
-                    return;
-                }
+                if self.gss.g.find_edge(w, u).is_none() {
+                    self.gss.g.add_edge(w, u, z);
 
-                self.gss.g.add_edge(w, u, z);
+                    if m != 0 {
+                        for &action in &self.table[(l, a)] {
+                            match action {
+                                lalr::Action::Reduce {
+                                    production,
+                                    count: t,
+                                } if t != 0 => self.reductions.push(Reduction {
+                                    node: u,
+                                    production,
+                                    count: t,
+                                    sppf_node: z,
+                                }),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             } else {
                 let w = self.gss.g.add_node(GssNode { state: l });
                 self.gss.head.insert(l, w);
@@ -344,20 +434,12 @@ impl<'grammar> Parser<'grammar> {
                             node: w,
                             production,
                             count: 0,
-                            sppf_node: SppfNode::Null(production.rhs),
+                            sppf_node: SppfNode::Null(&[]),
                         }),
-                        _ => {}
-                    }
-                }
-            }
-
-            if m != 0 {
-                for &action in &self.table[(l, a)] {
-                    match action {
                         lalr::Action::Reduce {
                             production,
                             count: t,
-                        } if t != 0 => self.reductions.push(Reduction {
+                        } if m != 0 && t != 0 => self.reductions.push(Reduction {
                             node: u,
                             production,
                             count: t,
@@ -366,7 +448,9 @@ impl<'grammar> Parser<'grammar> {
                         _ => {}
                     }
                 }
+            }
 
+            if !production.rhs.is_empty() {
                 // Add children to the result of the reduction
                 let children = path
                     .edges()
@@ -402,21 +486,6 @@ impl<'grammar> Parser<'grammar> {
         for Shift { node: v, goto: k } in self.shifts.drain(..).collect::<Vec<_>>() {
             if let Some(&w) = self.gss.head.get(&k) {
                 self.gss.g.add_edge(w, v, z);
-
-                for &action in &self.table[(k, a)] {
-                    match action {
-                        lalr::Action::Reduce {
-                            production,
-                            count: t,
-                        } if t != 0 => self.reductions.push(Reduction {
-                            node: v,
-                            production,
-                            count: t,
-                            sppf_node: z,
-                        }),
-                        _ => {}
-                    }
-                }
             } else {
                 let w = self.gss.g.add_node(GssNode { state: k });
                 self.gss.head.insert(k, w);
@@ -429,30 +498,32 @@ impl<'grammar> Parser<'grammar> {
                         }
                         lalr::Action::Reduce {
                             production,
-                            count: t,
-                        } if t != 0 => self.reductions.push(Reduction {
-                            node: v,
-                            production,
-                            count: t,
-                            sppf_node: z,
-                        }),
+                            count: 0,
+                        } => {
+                            self.reductions.push(Reduction {
+                                node: w,
+                                production,
+                                count: 0,
+                                sppf_node: SppfNode::Null(&[]),
+                            });
+                        }
                         _ => {}
                     }
                 }
+            }
 
-                for &action in &self.table[(k, a)] {
-                    match action {
-                        lalr::Action::Reduce {
-                            production,
-                            count: 0,
-                        } => self.reductions.push(Reduction {
-                            node: w,
-                            production,
-                            count: 0,
-                            sppf_node: SppfNode::Null(production.rhs),
-                        }),
-                        _ => {}
-                    }
+            for &action in &self.table[(k, a)] {
+                match action {
+                    lalr::Action::Reduce {
+                        production,
+                        count: t,
+                    } if t != 0 => self.reductions.push(Reduction {
+                        node: v,
+                        production,
+                        count: t,
+                        sppf_node: z,
+                    }),
+                    _ => {}
                 }
             }
         }
@@ -462,26 +533,66 @@ impl<'grammar> Parser<'grammar> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error;
 
+    // Will not work for infinite derivation trees.
+    fn node_to_str<'grammar>(sppf: &Sppf<'grammar>, node: SppfNode<'grammar>) -> String {
+        let symbol_str = match node.symbol(sppf) {
+            Ok(s) => s.to_string(),
+            Err(ss) => format!(
+                "<{}>",
+                ss.iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        };
+        let family: Vec<_> = node.family(sppf).collect();
+        match family.as_slice() {
+            [] => symbol_str,
+            alternatives => format!(
+                "{}({})",
+                symbol_str,
+                alternatives
+                    .iter()
+                    .map(|children| children
+                        .iter()
+                        .map(|&x| node_to_str(sppf, x))
+                        .collect::<Vec<_>>()
+                        .join(", "))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ),
+        }
+    }
+
+    /// The example Γ₂ from Scott et al.
     #[test]
-    fn test_gamma2() {
+    fn test_gamma2() -> Result<(), Box<dyn error::Error>> {
         let grammar = lalr::Grammar {
             num_symbols: 3,
             nonterminals: &[vec![vec![2, 0, 1], Vec::new()], vec![Vec::new()]],
         };
+        let parse_table = lalr::Table::new(&grammar);
+        let parser = Parser::new(&grammar, &parse_table);
+        let (sppf, root) = parser.parse([2, 2]).ok_or("Failed to parse")?;
+        assert_eq!(node_to_str(&sppf, root), "0(2, 0(2, <0,1>), <1>)");
+        Ok(())
+    }
 
-        let parser = Parser::new(&grammar);
-        dbg!(&parser.table);
-
-        dbg!(parser.parse([2, 2]));
-
-        /*
-        println!(
-            "{:?}",
-            petgraph::dot::Dot::with_config(&sppf.g, &[petgraph::dot::Config::EdgeNoLabel])
+    #[test]
+    fn test_dangling_else() -> Result<(), Box<dyn error::Error>> {
+        let grammar = lalr::Grammar {
+            num_symbols: 3,
+            nonterminals: &[vec![vec![1, 0], vec![1, 0, 2], Vec::new()]],
+        };
+        let parse_table = lalr::Table::new(&grammar);
+        let parser = Parser::new(&grammar, &parse_table);
+        let (sppf, root) = parser.parse([1, 1, 2]).ok_or("Failed to parse")?;
+        assert_eq!(
+            node_to_str(&sppf, root),
+            "0(1, 0(1, <0>), 2 | 1, 0(1, 0, 2))"
         );
-        */
-
-        assert!(false);
+        Ok(())
     }
 }
