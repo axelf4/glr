@@ -12,10 +12,10 @@ use std::hash::Hash;
 use std::mem;
 use std::ops;
 
-pub type Symbol = usize;
+pub type Symbol = u16;
 
-const S_PRIME: Symbol = usize::MAX;
-const EOF: Symbol = u16::MAX as usize;
+const S_PRIME: Symbol = u16::MAX - 1;
+const EOF: Symbol = u16::MAX;
 
 /// The first nonterminal is the start symbol.
 pub struct Grammar<'a> {
@@ -24,12 +24,12 @@ pub struct Grammar<'a> {
 }
 
 impl<'a> Grammar<'a> {
-    fn is_nonterminal(&self, symbol: usize) -> bool {
-        symbol < self.nonterminals.len()
+    fn is_nonterminal(&self, symbol: Symbol) -> bool {
+        (symbol as usize) < self.nonterminals.len()
     }
 
-    fn productions_for(&self, nonterminal: usize) -> Option<impl Iterator<Item = Production<'a>>> {
-        self.nonterminals.get(nonterminal).map(|alts| {
+    fn productions_for(&self, nonterminal: Symbol) -> Option<impl Iterator<Item = Production<'a>>> {
+        self.nonterminals.get(nonterminal as usize).map(|alts| {
             alts.into_iter().map(move |rhs| Production {
                 lhs: nonterminal,
                 rhs: &rhs,
@@ -38,7 +38,7 @@ impl<'a> Grammar<'a> {
     }
 
     fn productions(&'a self) -> impl Iterator<Item = Production<'a>> {
-        (0..self.nonterminals.len()).flat_map(|x| self.productions_for(x).unwrap())
+        (0..self.nonterminals.len() as u16).flat_map(|x| self.productions_for(x).unwrap())
     }
 }
 
@@ -330,15 +330,15 @@ pub struct Table<'grammar> {
 impl<'grammar> ops::Index<(StateId, Symbol)> for Table<'grammar> {
     type Output = Vec<Action<'grammar>>;
     fn index(&self, (i, symbol): (StateId, Symbol)) -> &Self::Output {
-        debug_assert!(symbol < self.num_symbols);
-        &self.table[self.num_symbols * i + symbol]
+        debug_assert!((symbol as usize) < self.num_symbols);
+        &self.table[self.num_symbols * i + symbol as usize]
     }
 }
 
 impl<'grammar> ops::IndexMut<(StateId, Symbol)> for Table<'grammar> {
     fn index_mut(&mut self, (i, symbol): (StateId, Symbol)) -> &mut Self::Output {
-        debug_assert!(symbol < self.num_symbols);
-        &mut self.table[self.num_symbols * i + symbol]
+        debug_assert!((symbol as usize) < self.num_symbols);
+        &mut self.table[self.num_symbols * i + symbol as usize]
     }
 }
 
@@ -490,7 +490,7 @@ impl<'grammar> Table<'grammar> {
         };
 
         // Build the parse table
-        let eof = g.num_symbols;
+        let eof = g.num_symbols as Symbol;
         let mut table = Table {
             num_symbols: g.num_symbols + 1,
             table: (0..states.node_count() * (g.num_symbols + 1))

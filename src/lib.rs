@@ -225,7 +225,7 @@ impl<'grammar> Parser<'grammar> {
         input: impl IntoIterator<Item = Symbol>,
     ) -> Option<(Sppf<'grammar>, SppfNodeRef<'grammar>)> {
         const START_STATE: lalr::StateId = 0;
-        let eof = self.grammar.num_symbols;
+        let eof = self.grammar.num_symbols as Symbol;
         let mut input = input.into_iter().chain(iter::once(eof));
 
         let mut a = if let Some(x) = input.next() {
