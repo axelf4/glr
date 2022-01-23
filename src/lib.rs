@@ -14,13 +14,15 @@ S → ε
 and using it to parse the input string `a`:
 
 ```rust
-use glr::{Parser, lalr::{self, Grammar}};
+use glr::{lalr, Grammar, Parser};
 let grammar = Grammar {
     num_symbols: 2,
     nonterminals: &[vec![vec![0, 0], vec![1], Vec::new()]],
 };
 let table = lalr::Table::new(&grammar);
-let (sppf, root) = Parser::new(&grammar, &table).parse([1]).ok_or("Failed to parse")?;
+let (sppf, root) = Parser::new(&grammar, &table)
+    .parse([1])
+    .ok_or("Failed to parse")?;
 
 // The family of the root node is three alternative lists of children
 let family: Vec<_> = root.family(&sppf).collect();
@@ -42,6 +44,9 @@ See: SCOTT, Elizabeth; JOHNSTONE, Adrian. Right nulled GLR
      parsers. ACM Transactions on Programming Languages and
      Systems (TOPLAS), 2006, 28.4: 577-618.
 */
+
+#![deny(missing_debug_implementations)]
+
 use petgraph::{
     graph::{self, EdgeIndex, NodeIndex},
     Graph,
@@ -51,7 +56,46 @@ use std::iter;
 
 pub mod lalr;
 
-use lalr::{Symbol, START_STATE};
+use lalr::START_STATE;
+
+/// Index of a language symbol.
+pub type Symbol = u16;
+
+/// Context-free grammar.
+#[derive(Debug)]
+pub struct Grammar<'a> {
+    /// The total number of symbols.
+    pub num_symbols: usize,
+    /// Lists of productions for each nonterminal symbol of the grammar.
+    ///
+    /// The first nonterminal is the start symbol.
+    pub nonterminals: &'a [Vec<Vec<Symbol>>],
+}
+
+impl<'a> Grammar<'a> {
+    fn is_nonterminal(&self, symbol: Symbol) -> bool {
+        (symbol as usize) < self.nonterminals.len()
+    }
+
+    fn productions_for(&self, nonterminal: Symbol) -> Option<impl Iterator<Item = Production<'a>>> {
+        self.nonterminals.get(nonterminal as usize).map(|alts| {
+            alts.iter().map(move |rhs| Production {
+                lhs: nonterminal,
+                rhs,
+            })
+        })
+    }
+
+    fn productions(&'a self) -> impl Iterator<Item = Production<'a>> {
+        (0..self.nonterminals.len() as u16).flat_map(|x| self.productions_for(x).unwrap())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Production<'grammar> {
+    pub lhs: Symbol,
+    pub rhs: &'grammar [Symbol],
+}
 
 #[derive(Clone, Debug)]
 struct SppfNodeData<'grammar> {
@@ -131,11 +175,13 @@ struct SppfLabel {
     generation: usize,
 }
 
+#[derive(Debug)]
 struct GssNode {
     state: lalr::StateId,
 }
 
 /// Graph structured stack.
+#[derive(Debug)]
 struct Gss<'grammar> {
     g: Graph<GssNode, SppfNode<'grammar>>,
     /// The nodes of the current generation.
@@ -237,7 +283,7 @@ impl<'grammar> Gss<'grammar> {
 struct Reduction<'grammar> {
     /// The GSS node from which the reduction is to be applied.
     node: NodeIndex,
-    production: lalr::Production<'grammar>,
+    production: Production<'grammar>,
     /// The number of items to pop off the stack.
     count: usize,
     /// The SPPF node which labels the first edge of the path down
@@ -255,8 +301,9 @@ struct Shift {
 }
 
 /// GLR parser.
+#[derive(Debug)]
 pub struct Parser<'grammar> {
-    grammar: &'grammar lalr::Grammar<'grammar>,
+    grammar: &'grammar Grammar<'grammar>,
     table: &'grammar lalr::Table<'grammar>,
     gss: Gss<'grammar>,
     /// The queue of reduction operations.
@@ -269,7 +316,7 @@ pub struct Parser<'grammar> {
 
 impl<'grammar> Parser<'grammar> {
     pub fn new(
-        grammar: &'grammar lalr::Grammar<'grammar>,
+        grammar: &'grammar Grammar<'grammar>,
         table: &'grammar lalr::Table<'grammar>,
     ) -> Self {
         let gss = Gss::new();
@@ -569,7 +616,7 @@ mod tests {
     /// The example Γ₂ from Scott et al.
     #[test]
     fn test_gamma2() -> Result<(), Box<dyn error::Error>> {
-        let grammar = lalr::Grammar {
+        let grammar = Grammar {
             num_symbols: 3,
             nonterminals: &[vec![vec![2, 0, 1], Vec::new()], vec![Vec::new()]],
         };
@@ -582,7 +629,7 @@ mod tests {
 
     #[test]
     fn test_dangling_else() -> Result<(), Box<dyn error::Error>> {
-        let grammar = lalr::Grammar {
+        let grammar = Grammar {
             num_symbols: 3,
             nonterminals: &[vec![vec![1, 0], vec![1, 0, 2], Vec::new()]],
         };
@@ -598,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_simple_includes() -> Result<(), Box<dyn error::Error>> {
-        let grammar = lalr::Grammar {
+        let grammar = Grammar {
             num_symbols: 3,
             nonterminals: &[vec![vec![1]], vec![vec![2]]],
         };

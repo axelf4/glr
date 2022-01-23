@@ -14,46 +14,10 @@ use std::hash::Hash;
 use std::mem;
 use std::ops;
 
-/// Index of a language symbol.
-pub type Symbol = u16;
+use crate::{Grammar, Production, Symbol};
 
 const S_PRIME: Symbol = u16::MAX - 1;
 const EOF: Symbol = u16::MAX;
-
-/// Context-free grammar.
-pub struct Grammar<'a> {
-    /// The total number of symbols.
-    pub num_symbols: usize,
-    /// Lists of productions for each nonterminal symbol of the grammar.
-    ///
-    /// The first nonterminal is the start symbol.
-    pub nonterminals: &'a [Vec<Vec<Symbol>>],
-}
-
-impl<'a> Grammar<'a> {
-    fn is_nonterminal(&self, symbol: Symbol) -> bool {
-        (symbol as usize) < self.nonterminals.len()
-    }
-
-    fn productions_for(&self, nonterminal: Symbol) -> Option<impl Iterator<Item = Production<'a>>> {
-        self.nonterminals.get(nonterminal as usize).map(|alts| {
-            alts.iter().map(move |rhs| Production {
-                lhs: nonterminal,
-                rhs,
-            })
-        })
-    }
-
-    fn productions(&'a self) -> impl Iterator<Item = Production<'a>> {
-        (0..self.nonterminals.len() as u16).flat_map(|x| self.productions_for(x).unwrap())
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Production<'grammar> {
-    pub lhs: Symbol,
-    pub rhs: &'grammar [Symbol],
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Item<'grammar> {
