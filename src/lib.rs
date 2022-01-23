@@ -595,4 +595,17 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn test_simple_includes() -> Result<(), Box<dyn error::Error>> {
+        let grammar = lalr::Grammar {
+            num_symbols: 3,
+            nonterminals: &[vec![vec![1]], vec![vec![2]]],
+        };
+        let parse_table = lalr::Table::new(&grammar);
+        let parser = Parser::new(&grammar, &parse_table);
+        let (sppf, root) = parser.parse([2]).ok_or("Failed to parse")?;
+        assert_eq!(node_to_str(&sppf, root), "0(1(2))");
+        Ok(())
+    }
 }

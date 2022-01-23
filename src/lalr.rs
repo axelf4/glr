@@ -452,15 +452,13 @@ impl<'grammar> Table<'grammar> {
                 // Run the state machine forward
                 let mut j = state;
                 for (cursor, &t) in item.production.rhs.iter().enumerate().skip(item.cursor) {
-                    if cursor > 0 {
-                        // If this (symbol, state) is a nonterminal transition
-                        if let Some(&trans) = xs_index.get(&Transition {
-                            state: j,
-                            symbol: t,
-                        }) {
-                            if item.production.rhs[cursor + 1..].iter().all(&nullable) {
-                                includes[trans].insert(i as u32);
-                            }
+                    // If this (symbol, state) is a nonterminal transition
+                    if let Some(&trans) = xs_index.get(&Transition {
+                        state: j,
+                        symbol: t,
+                    }) {
+                        if item.production.rhs[cursor + 1..].iter().all(&nullable) {
+                            includes[trans].insert(i as u32);
                         }
                     }
 
