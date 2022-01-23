@@ -6,6 +6,7 @@ edition = "2021"
 description = "RNGLR parser generator"
 homepage = "https://github.com/axelf4/glr"
 repository = "https://github.com/axelf4/glr"
+license = "Apache-2.0"
 keywords = ["parser", "LR", "grammar"]
 categories = ["parsing"]
 
