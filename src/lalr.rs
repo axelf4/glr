@@ -11,7 +11,6 @@ use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
-use std::mem;
 use std::ops;
 
 use crate::{Grammar, Production, Symbol};
@@ -185,11 +184,11 @@ impl<'grammar> Lr0Dfa<'grammar> {
 /// ```text
 /// F x =s F' x ∪ ⋃{F y | xRy}
 /// ```
-fn digraph<T, R, I, Fp>(xs: &[T], r: R, mut fp: Fp) -> Vec<BitSet>
+fn digraph<T, R, I, F>(xs: &[T], r: R, fp: F) -> F
 where
     R: Fn(usize) -> I,
     I: IntoIterator<Item = usize>,
-    Fp: FnMut(usize) -> BitSet,
+    F: AsMut<[BitSet]>,
 {
     // Let G = (X, R) be the digraph induced by R, for example
     //
@@ -218,26 +217,18 @@ where
     }
     use Mark::*;
 
+    let mut f = fp; // Initialize F x to F' x
     let mut stack = Vec::new();
-    let mut f = xs.iter().map(|_| Default::default()).collect();
     let mut n = vec![Unmarked; xs.len()];
 
     for (x, _) in xs.iter().enumerate() {
-        traverse(xs, &r, &mut fp, &mut stack, &mut f, &mut n, x);
+        traverse(&r, &mut stack, f.as_mut(), &mut n, x);
     }
 
-    fn traverse<T, R, I, Fp>(
-        xs: &[T],
-        r: &R,
-        fp: &mut Fp,
-        stack: &mut Vec<usize>,
-        f: &mut Vec<BitSet>,
-        n: &mut Vec<Mark>,
-        x: usize,
-    ) where
+    fn traverse<R, I>(r: &R, stack: &mut Vec<usize>, f: &mut [BitSet], n: &mut [Mark], x: usize)
+    where
         R: Fn(usize) -> I,
         I: IntoIterator<Item = usize>,
-        Fp: FnMut(usize) -> BitSet,
     {
         if n[x] != Unmarked {
             return;
@@ -245,14 +236,13 @@ where
         stack.push(x);
         let depth = stack.len();
         n[x] = Active(depth);
-        f[x] = fp(x);
 
         for y in r(x).into_iter() {
             if y == x {
                 continue;
             }
 
-            traverse(xs, r, fp, stack, f, n, y);
+            traverse(r, stack, f, n, y);
             n[x] = min(n[x], n[y]);
 
             if let (a, [fy, b @ ..]) = f.split_at_mut(y) {
@@ -405,7 +395,7 @@ impl<'grammar> Table<'grammar> {
         let mut includes: Vec<_> = xs.iter().map(|_| BitSet::new()).collect();
         // (q, A -> w) LOOKBACK (p, A) iff p --w-> q
         let mut lookback: HashMap<(NodeIndex, Production), HashSet<usize>> = HashMap::new();
-        for (i, &Transition { state, symbol: b }) in xs.iter().enumerate() {
+        for (x, &Transition { state, symbol: b }) in xs.iter().enumerate() {
             // Consider start B-items
             for item in states[state]
                 .item_set
@@ -414,41 +404,38 @@ impl<'grammar> Table<'grammar> {
                 .filter(|item| item.production.lhs == b && item.is_start())
             {
                 // Run the state machine forward
-                let mut j = state;
+                let mut i = state;
                 for (cursor, &t) in item.production.rhs.iter().enumerate().skip(item.cursor) {
                     // If this (symbol, state) is a nonterminal transition
                     if let Some(&trans) = xs_index.get(&Transition {
-                        state: j,
+                        state: i,
                         symbol: t,
                     }) {
                         if item.production.rhs[cursor + 1..].iter().all(&nullable) {
-                            includes[trans].insert(i as u32);
+                            includes[trans].insert(x as u32);
                         }
                     }
 
                     // Deviate from algorithm to include right nulled (RN) rules
                     if item.production.rhs[cursor..].iter().all(&nullable) {
-                        lookback.entry((j, item.production)).or_default().insert(i);
+                        lookback.entry((i, item.production)).or_default().insert(x);
                     }
 
-                    j = states.edges(j).find(|e| *e.weight() == t).unwrap().target();
+                    i = states.edges(i).find(|e| *e.weight() == t).unwrap().target();
                 }
-                // At this point j is the final state
-                lookback.entry((j, item.production)).or_default().insert(i);
+                // At this point i is the final state
+                lookback.entry((i, item.production)).or_default().insert(x);
             }
         }
 
-        let mut read = digraph(
+        let read: Vec<_> = digraph(
             &xs,
             |x| reads(xs[x]).map(|x| xs_index[&x]),
-            |x| dr(xs[x]).map(|x| x as u32).collect(),
+            xs.iter()
+                .map(|&x| dr(x).map(|x| x as u32).collect())
+                .collect(),
         );
-        let follow = digraph(
-            &xs,
-            |x| includes[x].iter().map(|x| x as usize),
-            // Reuse set since digraph calls F' on each element of X only once
-            |x| mem::take(&mut read[x]),
-        );
+        let follow = digraph(&xs, |x| includes[x].iter().map(|x| x as usize), read);
 
         // LA(q, A -> w) = U{Follow(p, A) | (q, A -> w) lookback (p, A)}
         let la = |q, production| {
