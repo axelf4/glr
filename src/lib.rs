@@ -190,40 +190,33 @@ struct Gss<'grammar> {
     generation_counts: Vec<usize>,
 }
 
-struct Path<'a, Ix> {
-    ctx: &'a WalkPaths<Ix>,
-    last_edge: Option<EdgeIndex<Ix>>,
-    last_node: NodeIndex<Ix>,
-}
+struct Path<'a, Ix>(&'a WalkPaths<Ix>);
 
 impl<'a, Ix> Path<'a, Ix> {
     fn last_node(&self) -> NodeIndex<Ix>
     where
         NodeIndex<Ix>: Copy,
     {
-        self.last_node
+        self.0
+            .stack
+            .last()
+            .map(|(_e, n, _)| *n)
+            .unwrap_or(self.0.from.0)
     }
 
     fn edges(&self) -> impl Iterator<Item = EdgeIndex<Ix>> + DoubleEndedIterator + 'a
     where
         EdgeIndex<Ix>: Copy,
     {
-        self.ctx
-            .stack
-            .iter()
-            .skip(1)
-            .map(|(e, _n, _i)| e.unwrap())
-            .chain(self.last_edge)
+        self.0.stack.iter().map(|(e, _n, _)| *e)
     }
 }
 
 struct WalkPaths<Ix = graph::DefaultIx> {
+    from: (NodeIndex<Ix>, graph::WalkNeighbors<Ix>),
     length: usize,
-    stack: Vec<(
-        Option<EdgeIndex<Ix>>,
-        NodeIndex<Ix>,
-        graph::WalkNeighbors<Ix>,
-    )>,
+    stack: Vec<(EdgeIndex<Ix>, NodeIndex<Ix>, graph::WalkNeighbors<Ix>)>,
+    has_yielded: bool,
 }
 
 impl<Ix> WalkPaths<Ix> {
@@ -232,22 +225,26 @@ impl<Ix> WalkPaths<Ix> {
         Ty: petgraph::EdgeType,
         Ix: graph::IndexType,
     {
-        let stack = &mut self.stack;
-        while let (l, Some(&mut (edge, node, ref mut iter))) = (stack.len(), stack.last_mut()) {
-            if l > self.length {
-                stack.pop();
-                return Some(Path {
-                    ctx: self,
-                    last_edge: edge,
-                    last_node: node,
-                });
-            } else if let Some((edge, next)) = iter.next(g) {
-                stack.push((Some(edge), next, g.neighbors(next).detach()));
+        loop {
+            if self.stack.len() < self.length {
+                if let Some((edge, next)) = self
+                    .stack
+                    .last_mut()
+                    .map(|(_, _, iter)| iter)
+                    .unwrap_or(&mut self.from.1)
+                    .next(g)
+                {
+                    self.stack.push((edge, next, g.neighbors(next).detach()));
+                    continue;
+                }
+            } else if self.has_yielded {
+                self.has_yielded = false;
             } else {
-                stack.pop(); // Exhausted iterator
+                self.has_yielded = true;
+                return Some(Path(self));
             }
+            self.stack.pop()?; // Exhausted iterator
         }
-        None
     }
 }
 
@@ -262,8 +259,10 @@ impl<'grammar> Gss<'grammar> {
 
     fn paths(&self, from: NodeIndex, length: usize) -> WalkPaths {
         WalkPaths {
+            from: (from, self.g.neighbors(from).detach()),
             length,
-            stack: vec![(None, from, self.g.neighbors(from).detach())],
+            stack: Vec::new(),
+            has_yielded: false,
         }
     }
 
