@@ -38,7 +38,6 @@ assert_eq!(family[1][1].symbol(&sppf), Err(&[0][..]));
 // right recursion.
 assert_eq!(family[2][0].symbol(&sppf), Ok(0));
 assert_eq!(family[2][1], root);
-# Ok::<(), &'static str>(())
 ```
 
 Any one of the infinitely many derivation trees can be recovered by

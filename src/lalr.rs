@@ -6,13 +6,13 @@ See: DEREMER, Frank; PENNELLO, Thomas. Efficient computation of
      Languages and Systems (TOPLAS), 1982, 4.4: 615-649.
 */
 use petgraph::{graph::NodeIndex, visit::EdgeRef as _, Graph};
-use roaring::RoaringBitmap as BitSet;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::ops;
 
+use crate::bit_set::BitSet;
 use crate::{Grammar, Production, Symbol};
 
 const S_PRIME: Symbol = u16::MAX - 1;
@@ -247,7 +247,7 @@ where
 
             if let (a, [fy, b @ ..]) = f.split_at_mut(y) {
                 let fx = if x < y { &mut a[x] } else { &mut b[x - y - 1] };
-                *fx |= &*fy;
+                *fx |= fy;
             } else {
                 unreachable!()
             }
@@ -320,24 +320,21 @@ impl<'grammar> Table<'grammar> {
 
         // Build the LALR(1) lookahead sets from the LR(0) automata
         let nullable = {
-            let mut set = HashSet::new();
-            // Simple O(n^2) fixpoint algorithm
-            loop {
-                let mut finished = true;
+            let mut set = BitSet::new();
+            let mut changed = true;
+            while changed {
+                changed = false;
                 for production in g.productions() {
-                    if !set.contains(&production.lhs)
-                        && production.rhs.iter().all(|x| set.contains(x))
+                    if !set.contains(production.lhs.into())
+                        && production.rhs.iter().all(|&x| set.contains(x.into()))
                     {
-                        set.insert(production.lhs);
-                        finished = false;
+                        set.insert(production.lhs.into());
+                        changed = true;
                     }
-                }
-                if finished {
-                    break;
                 }
             }
 
-            move |x: &Symbol| set.contains(x)
+            move |&x: &Symbol| set.contains(x.into())
         };
 
         #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -392,7 +389,7 @@ impl<'grammar> Table<'grammar> {
         };
 
         // (p, A) INCLUDES (p', B) iff B -> L A T,  T =>* eps, and p' --L-> p
-        let mut includes: Vec<_> = xs.iter().map(|_| BitSet::new()).collect();
+        let mut includes = vec![BitSet::new(); xs.len()];
         // (q, A -> w) LOOKBACK (p, A) iff p --w-> q
         let mut lookback: HashMap<(NodeIndex, Production), HashSet<usize>> = HashMap::new();
         for (x, &Transition { state, symbol: b }) in xs.iter().enumerate() {
@@ -404,12 +401,12 @@ impl<'grammar> Table<'grammar> {
                 .filter(|item| item.production.lhs == b && item.is_start())
             {
                 // Run the state machine forward
-                let mut i = state;
-                for (cursor, &t) in item.production.rhs.iter().enumerate().skip(item.cursor) {
-                    // If this (symbol, state) is a nonterminal transition
+                let mut p = state;
+                for (cursor, &a) in item.production.rhs.iter().enumerate().skip(item.cursor) {
+                    // If (p, A) is a nonterminal transition
                     if let Some(&trans) = xs_index.get(&Transition {
-                        state: i,
-                        symbol: t,
+                        state: p,
+                        symbol: a,
                     }) {
                         if item.production.rhs[cursor + 1..].iter().all(&nullable) {
                             includes[trans].insert(x as u32);
@@ -418,13 +415,13 @@ impl<'grammar> Table<'grammar> {
 
                     // Deviate from algorithm to include right nulled (RN) rules
                     if item.production.rhs[cursor..].iter().all(&nullable) {
-                        lookback.entry((i, item.production)).or_default().insert(x);
+                        lookback.entry((p, item.production)).or_default().insert(x);
                     }
 
-                    i = states.edges(i).find(|e| *e.weight() == t).unwrap().target();
+                    p = states.edges(p).find(|e| *e.weight() == a).unwrap().target();
                 }
                 // At this point i is the final state
-                lookback.entry((i, item.production)).or_default().insert(x);
+                lookback.entry((p, item.production)).or_default().insert(x);
             }
         }
 
@@ -438,7 +435,7 @@ impl<'grammar> Table<'grammar> {
         let follow = digraph(&xs, |x| includes[x].iter().map(|x| x as usize), read);
 
         // LA(q, A -> w) = U{Follow(p, A) | (q, A -> w) lookback (p, A)}
-        let la = |q, production| {
+        let lookahead = |q, production| {
             lookback
                 .get(&(q, production))
                 .into_iter()
@@ -481,7 +478,7 @@ impl<'grammar> Table<'grammar> {
                 .iter()
                 .filter(|item| item.production.lhs != S_PRIME)
             {
-                for s in la(i, item.production) {
+                for s in lookahead(i, item.production) {
                     let s = if s == EOF { eof } else { s };
 
                     let actions = &mut table[(i.index(), s)];

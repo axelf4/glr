@@ -12,4 +12,4 @@ categories = ["parsing"]
 
 [dependencies]
 petgraph = { version = "0.6.0", default-features = false }
-roaring = "0.8.1"
+bit-set = "0.5.3"

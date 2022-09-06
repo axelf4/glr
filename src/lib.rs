@@ -54,6 +54,7 @@ use petgraph::{
 use std::collections::HashMap;
 use std::iter;
 
+mod bit_set;
 pub mod lalr;
 
 use lalr::START_STATE;
@@ -275,6 +276,12 @@ impl<'grammar> Gss<'grammar> {
             Err(i) => i,
         }
     }
+
+    fn add_node(&mut self, state: lalr::StateId) -> NodeIndex {
+        let v = self.g.add_node(GssNode { state });
+        self.head.insert(state, v);
+        v
+    }
 }
 
 /// Pending reduction.
@@ -344,8 +351,7 @@ impl<'grammar> Parser<'grammar> {
         let mut a = input.next().unwrap();
 
         let mut generation = 0;
-        let v0 = self.gss.g.add_node(GssNode { state: START_STATE });
-        self.gss.head.insert(START_STATE, v0);
+        let v0 = self.gss.add_node(START_STATE);
 
         for &action in &self.table[(START_STATE, a)] {
             match action {
@@ -367,7 +373,9 @@ impl<'grammar> Parser<'grammar> {
         while !self.gss.head.is_empty() {
             self.recent_sppf_nodes.clear();
 
-            self.reduce_all(a);
+            while let Some(reduction) = self.reductions.pop() {
+                self.reduce(a, reduction);
+            }
 
             let prev = a;
             a = if let Some(x) = input.next() {
@@ -379,7 +387,7 @@ impl<'grammar> Parser<'grammar> {
             self.gss.head.clear();
             generation += 1;
 
-            self.shifter(generation, prev, a);
+            self.shift(generation, prev, a);
         }
 
         let acc_node = self.gss.head.iter().find_map(|(&state, &t)| {
@@ -394,12 +402,6 @@ impl<'grammar> Parser<'grammar> {
             }
         });
         acc_node.map(|node| (self.sppf, node))
-    }
-
-    fn reduce_all(&mut self, a: Symbol) {
-        while let Some(reduction) = self.reductions.pop() {
-            self.reduce(a, reduction);
-        }
     }
 
     fn reduce(
@@ -464,8 +466,7 @@ impl<'grammar> Parser<'grammar> {
                     }
                 }
             } else {
-                let w = self.gss.g.add_node(GssNode { state: l });
-                self.gss.head.insert(l, w);
+                let w = self.gss.add_node(l);
                 self.gss.g.add_edge(w, u, z);
 
                 for &action in &self.table[(l, a)] {
@@ -519,7 +520,7 @@ impl<'grammar> Parser<'grammar> {
     }
 
     /// * a: The current lookahead symbol.
-    fn shifter(&mut self, gen: usize, b: Symbol, a: Symbol) {
+    fn shift(&mut self, gen: usize, b: Symbol, a: Symbol) {
         let z = SppfNode::Leaf { symbol: b };
         self.recent_sppf_nodes.insert(
             SppfLabel {
@@ -533,8 +534,7 @@ impl<'grammar> Parser<'grammar> {
             if let Some(&w) = self.gss.head.get(&k) {
                 self.gss.g.add_edge(w, v, z);
             } else {
-                let w = self.gss.g.add_node(GssNode { state: k });
-                self.gss.head.insert(k, w);
+                let w = self.gss.add_node(k);
                 self.gss.g.add_edge(w, v, z);
 
                 for &action in &self.table[(k, a)] {
