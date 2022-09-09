@@ -1,5 +1,5 @@
 use std::ops::BitOrAssign;
-use std::{fmt, iter, slice};
+use std::{fmt, iter, mem, slice};
 
 #[derive(Clone, Default)]
 pub struct BitSet(Vec<u32>);
@@ -12,14 +12,22 @@ impl BitSet {
     pub fn contains(&self, x: u32) -> bool {
         self.0
             .get((x / u32::BITS) as usize)
-            .map_or(false, |u| u & 1 << x % u32::BITS != 0)
+            .map_or(false, |&u| u & 1 << (x % u32::BITS) != 0)
     }
 
     pub fn insert(&mut self, x: u32) {
         let i: usize = (x / u32::BITS) as usize;
         self.0
             .extend(iter::repeat(0).take((i + 1).saturating_sub(self.0.len())));
-        self.0[i] |= 1 << x % u32::BITS;
+        self.0[i] |= 1 << (x % u32::BITS);
+    }
+
+    pub fn len(&self) -> u32 {
+        self.0.iter().copied().map(u32::count_ones).sum()
+    }
+
+    pub fn clear(&mut self) {
+        self.0.fill(0);
     }
 
     pub fn iter(&self) -> Iter<iter::Copied<slice::Iter<u32>>> {
@@ -34,6 +42,15 @@ impl BitOrAssign<&BitSet> for BitSet {
         }
         self.0
             .extend_from_slice(rhs.0.get(self.0.len()..).unwrap_or(&[]));
+    }
+}
+
+impl BitOrAssign<BitSet> for BitSet {
+    fn bitor_assign(&mut self, mut rhs: BitSet) {
+        if rhs.0.len() > self.0.len() {
+            mem::swap(self, &mut rhs);
+        }
+        *self |= &rhs;
     }
 }
 

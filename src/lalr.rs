@@ -5,7 +5,8 @@ See: DEREMER, Frank; PENNELLO, Thomas. Efficient computation of
      LALR (1) look-ahead sets. ACM Transactions on Programming
      Languages and Systems (TOPLAS), 1982, 4.4: 615-649.
 */
-use petgraph::{graph::NodeIndex, visit::EdgeRef as _, Graph};
+use petgraph::visit::{EdgeRef as _, IntoNodeReferences as _};
+use petgraph::{graph::NodeIndex, Graph};
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -87,6 +88,10 @@ impl<'grammar> ItemSet<'grammar> {
         }
         self
     }
+
+    fn iter(&self) -> impl Iterator<Item = &Item<'grammar>> {
+        self.0.iter()
+    }
 }
 
 /// A state is uniquely identified by its "seed" items, i.e. the kernel.
@@ -130,12 +135,11 @@ impl<'grammar> Lr0Dfa<'grammar> {
         let mut states = Graph::new();
         // Augment the grammar with a production `S' → S`, where `S` is the start symbol.
         // To generate the initial item set, take the closure of the item `S' → •S`.
-        let production0 = Production {
-            lhs: S_PRIME,
-            rhs: &[0, EOF],
-        };
         let kernel0 = Kernel::start(vec![Item {
-            production: production0,
+            production: Production {
+                lhs: S_PRIME,
+                rhs: &[0, EOF],
+            },
             cursor: 0,
         }]);
         let state0 = states.add_node(State {
@@ -147,7 +151,7 @@ impl<'grammar> Lr0Dfa<'grammar> {
         while let Some(n) = stack.pop() {
             // All transitions on shifted symbols from this state
             let mut goto_sets: HashMap<_, Vec<_>> = HashMap::new();
-            for (symbol, item) in states[n].item_set.0.iter().filter_map(Item::shift_symbol) {
+            for (symbol, item) in states[n].item_set.iter().filter_map(Item::shift_symbol) {
                 goto_sets.entry(symbol).or_default().push(item);
             }
 
@@ -184,7 +188,7 @@ impl<'grammar> Lr0Dfa<'grammar> {
 /// ```text
 /// F x =s F' x ∪ ⋃{F y | xRy}
 /// ```
-fn digraph<T, R, I, F>(xs: &[T], r: R, fp: F) -> F
+fn digraph<R, I, F>(xs_len: usize, r: R, fp: F) -> F
 where
     R: Fn(usize) -> I,
     I: IntoIterator<Item = usize>,
@@ -219,9 +223,9 @@ where
 
     let mut f = fp; // Initialize F x to F' x
     let mut stack = Vec::new();
-    let mut n = vec![Unmarked; xs.len()];
+    let mut n = vec![Unmarked; xs_len];
 
-    for (x, _) in xs.iter().enumerate() {
+    for x in 0..xs_len {
         traverse(&r, &mut stack, f.as_mut(), &mut n, x);
     }
 
@@ -247,7 +251,7 @@ where
 
             if let (a, [fy, b @ ..]) = f.split_at_mut(y) {
                 let fx = if x < y { &mut a[x] } else { &mut b[x - y - 1] };
-                *fx |= fy;
+                *fx |= &*fy;
             } else {
                 unreachable!()
             }
@@ -312,29 +316,59 @@ impl<'grammar> ops::IndexMut<(StateId, Symbol)> for Table<'grammar> {
 impl<'grammar> Table<'grammar> {
     /// Builds a new parse table from the given grammar.
     pub fn new(g: &'grammar Grammar) -> Self {
-        debug_assert!(
-            g.num_symbols < u16::MAX.into(),
-            "Symbol indices are too large."
-        );
+        assert!(g.num_symbols < u16::MAX.into(), "too many symbols");
         let Lr0Dfa { states, .. } = Lr0Dfa::new(g);
+        let eof = g.num_symbols as Symbol;
 
         // Build the LALR(1) lookahead sets from the LR(0) automata
-        let nullable = {
-            let mut set = BitSet::new();
+        let (nullable, nt_first) = {
+            // First sets for all nonterminals
+            let mut nt_first = vec![BitSet::new(); g.nonterminals.len()];
+            let mut nullables = BitSet::new();
             let mut changed = true;
             while changed {
                 changed = false;
+                let mut result = BitSet::new();
                 for production in g.productions() {
-                    if !set.contains(production.lhs.into())
-                        && production.rhs.iter().all(|&x| set.contains(x.into()))
-                    {
-                        set.insert(production.lhs.into());
-                        changed = true;
+                    let mut is_nullable = true;
+                    for &symbol in production.rhs {
+                        if g.is_nonterminal(symbol) {
+                            is_nullable &= nullables.contains(symbol.into());
+                            result |= &nt_first[symbol as usize];
+                        } else {
+                            is_nullable = false;
+                            result.insert(symbol.into());
+                        }
+                        if !is_nullable {
+                            break;
+                        }
                     }
+
+                    if is_nullable && !nullables.contains(production.lhs.into()) {
+                        changed = true;
+                        nullables.insert(production.lhs.into());
+                    }
+                    let len = nt_first[production.lhs as usize].len();
+                    nt_first[production.lhs as usize] |= &result;
+                    changed |= nt_first[production.lhs as usize].len() != len;
+                    result.clear();
                 }
             }
 
-            move |&x: &Symbol| set.contains(x.into())
+            (move |x: Symbol| nullables.contains(x.into()), nt_first)
+        };
+        let add_first = |iter, out: &mut BitSet| {
+            for symbol in iter {
+                if g.is_nonterminal(symbol) {
+                    *out |= &nt_first[symbol as usize];
+                    if !nullable(symbol) {
+                        break;
+                    }
+                } else {
+                    out.insert(symbol.into());
+                    break;
+                }
+            }
         };
 
         #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -344,96 +378,84 @@ impl<'grammar> Table<'grammar> {
         }
 
         // The set of nonterminal transitions of the LR(0) parser
-        let xs: Vec<Transition> = states
-            .node_indices()
-            .flat_map(|state| {
-                states
-                    .edges(state)
-                    .map(|e| *e.weight())
-                    .filter(|&s| g.is_nonterminal(s))
-                    .map(move |symbol| Transition { state, symbol })
+        let xs: HashMap<_, _> = states
+            .edge_references()
+            .filter_map(|e| {
+                let state = e.source();
+                let symbol = *e.weight();
+                if g.is_nonterminal(symbol) {
+                    Some(Transition { state, symbol })
+                } else {
+                    None
+                }
             })
-            .collect();
-        let xs_index: HashMap<Transition, usize> = xs
-            .iter()
-            .copied()
             .enumerate()
-            .map(|(i, trans)| (trans, i))
+            .map(|(i, transition)| (transition, i))
             .collect();
 
-        // Returns direct read symbols
-        let dr = |Transition {
-                      state: p,
-                      symbol: a,
-                  }| {
-            states
-                .edges(states.edges(p).find(|e| *e.weight() == a).unwrap().target())
-                .map(|e| *e.weight())
-                .filter(|&x| !g.is_nonterminal(x))
-        };
-
-        // (p, A) READS (r, C) iff p --A-> r --C-> and C =>* eps
-        let reads = |Transition {
-                         state: p,
-                         symbol: a,
-                     }| {
-            let r = states.edges(p).find(|e| *e.weight() == a).unwrap().target();
-            states
-                .edges(r)
-                .map(|e| *e.weight())
-                .filter(&nullable)
-                .map(move |c| Transition {
-                    state: r,
-                    symbol: c,
-                })
-        };
+        // Read(p, A) are the terminals that can be read before any
+        // phrase including A is reduced. Compute using first sets as
+        // in: IVES, Fred. Unifying view of recent LALR (1) lookahead
+        // set algorithms. ACM SIGPLAN Notices, 1986, 21.7: 131-135.
+        let mut read = vec![BitSet::new(); xs.len()];
+        read[xs[&Transition {
+            state: NodeIndex::new(START_STATE),
+            symbol: 0,
+        }]]
+            .insert(eof.into());
 
         // (p, A) INCLUDES (p', B) iff B -> L A T,  T =>* eps, and p' --L-> p
         let mut includes = vec![BitSet::new(); xs.len()];
         // (q, A -> w) LOOKBACK (p, A) iff p --w-> q
-        let mut lookback: HashMap<(NodeIndex, Production), HashSet<usize>> = HashMap::new();
-        for (x, &Transition { state, symbol: b }) in xs.iter().enumerate() {
+        let mut lookback: HashMap<(NodeIndex, Production), BitSet> = HashMap::new();
+        for (&Transition { state, symbol: b }, &x) in xs.iter() {
             // Consider start B-items
             for item in states[state]
                 .item_set
-                .0
                 .iter()
-                .filter(|item| item.production.lhs == b && item.is_start())
+                .filter(|&item| item.production.lhs == b && item.is_start())
             {
                 // Run the state machine forward
                 let mut p = state;
                 for (cursor, &a) in item.production.rhs.iter().enumerate().skip(item.cursor) {
                     // If (p, A) is a nonterminal transition
-                    if let Some(&trans) = xs_index.get(&Transition {
+                    if let Some(&y) = xs.get(&Transition {
                         state: p,
                         symbol: a,
                     }) {
-                        if item.production.rhs[cursor + 1..].iter().all(&nullable) {
-                            includes[trans].insert(x as u32);
+                        add_first(
+                            item.production.rhs[cursor + 1..].iter().copied(),
+                            &mut read[y],
+                        );
+
+                        if item.production.rhs[cursor + 1..]
+                            .iter()
+                            .copied()
+                            .all(&nullable)
+                        {
+                            includes[y].insert(x as u32);
                         }
                     }
 
-                    // Deviate from algorithm to include right nulled (RN) rules
-                    if item.production.rhs[cursor..].iter().all(&nullable) {
-                        lookback.entry((p, item.production)).or_default().insert(x);
+                    // Include right nulled (RN) rules
+                    if item.production.rhs[cursor..].iter().copied().all(&nullable) {
+                        lookback
+                            .entry((p, item.production))
+                            .or_default()
+                            .insert(x as u32);
                     }
 
                     p = states.edges(p).find(|e| *e.weight() == a).unwrap().target();
                 }
-                // At this point i is the final state
-                lookback.entry((p, item.production)).or_default().insert(x);
+                // At this point p is the final state
+                lookback
+                    .entry((p, item.production))
+                    .or_default()
+                    .insert(x as u32);
             }
         }
 
-        let read: Vec<_> = digraph(
-            &xs,
-            |x| reads(xs[x]).map(|x| xs_index[&x]),
-            xs.iter()
-                .map(|&x| dr(x).map(|x| x as u32).collect())
-                .collect(),
-        );
-        let follow = digraph(&xs, |x| includes[x].iter().map(|x| x as usize), read);
-
+        let follow = digraph(xs.len(), |x| includes[x].iter().map(|x| x as usize), read);
         // LA(q, A -> w) = U{Follow(p, A) | (q, A -> w) lookback (p, A)}
         let lookahead = |q, production| {
             lookback
@@ -442,29 +464,23 @@ impl<'grammar> Table<'grammar> {
                 .flat_map(|transitions| {
                     transitions
                         .iter()
-                        .flat_map(|&transition| &follow[transition])
+                        .flat_map(|transition| &follow[transition as usize])
                         .map(|x| x as Symbol)
                 })
         };
 
         // Build the parse table
-        let eof = g.num_symbols as Symbol;
         let mut table = Table {
-            num_symbols: g.num_symbols + 1,
-            table: (0..states.node_count() * (g.num_symbols + 1))
-                .into_iter()
-                .map(|_| Vec::new())
-                .collect(),
+            num_symbols: g.num_symbols + /* eof */ 1,
+            table: vec![Vec::new(); states.node_count() * (g.num_symbols + 1)],
         };
-        for i in states.node_indices() {
-            let state = &states[i];
-
+        for (i, state) in states.node_references() {
             for e in states.edges(i) {
                 let symbol = *e.weight();
                 if symbol == EOF {
                     continue;
                 }
-                let actions = &mut table[(e.source().index(), symbol)];
+                let actions = &mut table[(i.index(), symbol)];
                 actions.push(Action::Shift {
                     goto: e.target().index(),
                 });
@@ -474,13 +490,10 @@ impl<'grammar> Table<'grammar> {
             // corresponding row with reduce action for P.
             for item in state
                 .item_set
-                .0
                 .iter()
                 .filter(|item| item.production.lhs != S_PRIME)
             {
                 for s in lookahead(i, item.production) {
-                    let s = if s == EOF { eof } else { s };
-
                     let actions = &mut table[(i.index(), s)];
                     let new_action = Action::Reduce {
                         production: item.production,
@@ -495,7 +508,6 @@ impl<'grammar> Table<'grammar> {
             // For every state containing S' → w•eof, set accept in eof column
             if state
                 .item_set
-                .0
                 .iter()
                 .any(|item| item.production.lhs == S_PRIME && item.next_symbol() == Some(EOF))
             {
@@ -504,7 +516,7 @@ impl<'grammar> Table<'grammar> {
         }
 
         // If S ⇒* ε, set accept in eof column in the start state.
-        if nullable(&0) {
+        if nullable(0) {
             table[(START_STATE, eof)].push(Action::Accept);
         }
 
