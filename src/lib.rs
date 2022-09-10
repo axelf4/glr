@@ -46,6 +46,7 @@ See: SCOTT, Elizabeth; JOHNSTONE, Adrian. Right nulled GLR
 */
 
 #![deny(missing_debug_implementations)]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 
 use petgraph::{
     graph::{self, EdgeIndex, NodeIndex},
@@ -144,8 +145,7 @@ impl<'grammar> SppfNode<'grammar> {
         sppf: &'a Sppf<'grammar>,
     ) -> impl Iterator<Item = &'a [SppfNode<'grammar>]> {
         self.data(sppf)
-            .map(|data| data.family.iter())
-            .unwrap_or_else(|| [].iter())
+            .map_or_else(|| [].iter(), |data| data.family.iter())
             .map(AsRef::as_ref)
     }
 }
@@ -198,11 +198,7 @@ impl<'a, Ix> Path<'a, Ix> {
     where
         NodeIndex<Ix>: Copy,
     {
-        self.0
-            .stack
-            .last()
-            .map(|(_e, n, _)| *n)
-            .unwrap_or(self.0.from.0)
+        self.0.stack.last().map_or(self.0.from.0, |(_e, n, _)| *n)
     }
 
     fn edges(&self) -> impl Iterator<Item = EdgeIndex<Ix>> + DoubleEndedIterator + 'a
@@ -231,8 +227,7 @@ impl<Ix> WalkPaths<Ix> {
                 if let Some((edge, next)) = self
                     .stack
                     .last_mut()
-                    .map(|(_, _, iter)| iter)
-                    .unwrap_or(&mut self.from.1)
+                    .map_or(&mut self.from.1, |(_, _, iter)| iter)
                     .next(g)
                 {
                     self.stack.push((edge, next, g.neighbors(next).detach()));
@@ -353,7 +348,7 @@ impl<'grammar> Parser<'grammar> {
         let mut generation = 0;
         let v0 = self.gss.add_node(START_STATE);
 
-        for &action in &self.table[(START_STATE, a)] {
+        for action in self.table.get(START_STATE, a) {
             match action {
                 lalr::Action::Shift { goto } => self.shifts.push(Shift { node: v0, goto }),
                 lalr::Action::Reduce {
@@ -365,8 +360,8 @@ impl<'grammar> Parser<'grammar> {
                     count: 0,
                     sppf_node: SppfNode::Null(&[]),
                 }),
+                lalr::Action::Reduce { .. } => {}
                 lalr::Action::Accept => return Some((self.sppf, SppfNode::Null(&[0]))),
-                _ => {}
             }
         }
 
@@ -391,8 +386,9 @@ impl<'grammar> Parser<'grammar> {
         }
 
         let acc_node = self.gss.head.iter().find_map(|(&state, &t)| {
-            if self.table[(state, eof)]
-                .iter()
+            if self
+                .table
+                .get(state, eof)
                 .any(|action| matches!(action, lalr::Action::Accept))
             {
                 let sppf_node = self.gss.g[self.gss.g.find_edge(t, v0).unwrap()];
@@ -418,8 +414,9 @@ impl<'grammar> Parser<'grammar> {
         while let Some(path) = paths.next(&self.gss.g) {
             let u = path.last_node();
             let k = self.gss.g[u].state;
-            let l = *self.table[(k, production.lhs)]
-                .iter()
+            let l = self
+                .table
+                .get(k, production.lhs)
                 .find_map(|action| {
                     if let lalr::Action::Shift { goto } = action {
                         Some(goto)
@@ -449,7 +446,7 @@ impl<'grammar> Parser<'grammar> {
                     self.gss.g.add_edge(w, u, z);
 
                     if m != 0 {
-                        for &action in &self.table[(l, a)] {
+                        for action in self.table.get(l, a) {
                             match action {
                                 lalr::Action::Reduce {
                                     production,
@@ -469,7 +466,7 @@ impl<'grammar> Parser<'grammar> {
                 let w = self.gss.add_node(l);
                 self.gss.g.add_edge(w, u, z);
 
-                for &action in &self.table[(l, a)] {
+                for action in self.table.get(l, a) {
                     match action {
                         lalr::Action::Shift { goto: h } => {
                             self.shifts.push(Shift { node: w, goto: h });
@@ -537,7 +534,7 @@ impl<'grammar> Parser<'grammar> {
                 let w = self.gss.add_node(k);
                 self.gss.g.add_edge(w, v, z);
 
-                for &action in &self.table[(k, a)] {
+                for action in self.table.get(k, a) {
                     match action {
                         lalr::Action::Shift { goto: h } => {
                             self.shifts.push(Shift { node: w, goto: h });
@@ -558,7 +555,7 @@ impl<'grammar> Parser<'grammar> {
                 }
             }
 
-            for &action in &self.table[(k, a)] {
+            for action in self.table.get(k, a) {
                 match action {
                     lalr::Action::Reduce {
                         production,

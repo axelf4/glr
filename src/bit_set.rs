@@ -35,8 +35,8 @@ impl BitSet {
     }
 }
 
-impl BitOrAssign<&BitSet> for BitSet {
-    fn bitor_assign(&mut self, rhs: &BitSet) {
+impl BitOrAssign<&Self> for BitSet {
+    fn bitor_assign(&mut self, rhs: &Self) {
         for (a, &b) in self.0.iter_mut().zip(rhs.0.iter()) {
             *a |= b;
         }
@@ -45,8 +45,8 @@ impl BitOrAssign<&BitSet> for BitSet {
     }
 }
 
-impl BitOrAssign<BitSet> for BitSet {
-    fn bitor_assign(&mut self, mut rhs: BitSet) {
+impl BitOrAssign<Self> for BitSet {
+    fn bitor_assign(&mut self, mut rhs: Self) {
         if rhs.0.len() > self.0.len() {
             mem::swap(self, &mut rhs);
         }

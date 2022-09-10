@@ -7,11 +7,11 @@ See: DEREMER, Frank; PENNELLO, Thomas. Efficient computation of
 */
 use petgraph::visit::{EdgeRef as _, IntoNodeReferences as _};
 use petgraph::{graph::NodeIndex, Graph};
+use smallvec::SmallVec;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::hash::Hash;
-use std::ops;
+use std::{fmt, mem};
 
 use crate::bit_set::BitSet;
 use crate::{Grammar, Production, Symbol};
@@ -50,8 +50,7 @@ impl<'grammar> Item<'grammar> {
 
 impl fmt::Display for Item<'_> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        self.production.lhs.fmt(fmt)?;
-        write!(fmt, " →")?;
+        write!(fmt, "{} →", self.production.lhs)?;
         let (before, after) = self.production.rhs.split_at(self.cursor);
         before.iter().try_for_each(|t| write!(fmt, " {}", t))?;
         write!(fmt, " •")?;
@@ -78,7 +77,7 @@ impl<'grammar> ItemSet<'grammar> {
                             cursor: 0,
                         };
                         if set.insert(new_item) {
-                            self.0.push(new_item)
+                            self.0.push(new_item);
                         }
                     }
                 }
@@ -241,7 +240,7 @@ where
         let depth = stack.len();
         n[x] = Active(depth);
 
-        for y in r(x).into_iter() {
+        for y in r(x) {
             if y == x {
                 continue;
             }
@@ -262,10 +261,9 @@ where
                 let z = stack.pop().unwrap();
                 if z == x {
                     break;
-                } else {
-                    n[z] = FoundScc;
-                    f[z] = f[x].clone();
                 }
+                n[z] = FoundScc;
+                f[z] = f[x].clone();
             }
         }
     }
@@ -279,7 +277,7 @@ pub type StateId = usize;
 pub const START_STATE: StateId = 0;
 
 /// LR parse action.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Action<'grammar> {
     Shift {
         goto: StateId,
@@ -291,32 +289,22 @@ pub enum Action<'grammar> {
     Accept,
 }
 
+union TableEntry<'grammar> {
+    count: usize,
+    action: Action<'grammar>,
+}
+
 /// LALR(1) parse table.
-#[derive(Debug)]
 pub struct Table<'grammar> {
-    num_symbols: usize,
-    table: Vec<Vec<Action<'grammar>>>,
-}
-
-impl<'grammar> ops::Index<(StateId, Symbol)> for Table<'grammar> {
-    type Output = Vec<Action<'grammar>>;
-    fn index(&self, (i, symbol): (StateId, Symbol)) -> &Self::Output {
-        debug_assert!((symbol as usize) < self.num_symbols);
-        &self.table[self.num_symbols * i + symbol as usize]
-    }
-}
-
-impl<'grammar> ops::IndexMut<(StateId, Symbol)> for Table<'grammar> {
-    fn index_mut(&mut self, (i, symbol): (StateId, Symbol)) -> &mut Self::Output {
-        debug_assert!((symbol as usize) < self.num_symbols);
-        &mut self.table[self.num_symbols * i + symbol as usize]
-    }
+    grammar: &'grammar Grammar<'grammar>,
+    entries: Vec<TableEntry<'grammar>>,
+    table: Vec<u16>,
 }
 
 impl<'grammar> Table<'grammar> {
     /// Builds a new parse table from the given grammar.
     pub fn new(g: &'grammar Grammar) -> Self {
-        assert!(g.num_symbols < u16::MAX.into(), "too many symbols");
+        assert!(g.num_symbols <= u16::MAX.into(), "too many symbols");
         let Lr0Dfa { states, .. } = Lr0Dfa::new(g);
         let eof = g.num_symbols as Symbol;
 
@@ -408,7 +396,7 @@ impl<'grammar> Table<'grammar> {
         let mut includes = vec![BitSet::new(); xs.len()];
         // (q, A -> w) LOOKBACK (p, A) iff p --w-> q
         let mut lookback: HashMap<(NodeIndex, Production), BitSet> = HashMap::new();
-        for (&Transition { state, symbol: b }, &x) in xs.iter() {
+        for (&Transition { state, symbol: b }, &x) in &xs {
             // Consider start B-items
             for item in states[state]
                 .item_set
@@ -470,22 +458,12 @@ impl<'grammar> Table<'grammar> {
         };
 
         // Build the parse table
-        let mut table = Table {
-            num_symbols: g.num_symbols + /* eof */ 1,
-            table: vec![Vec::new(); states.node_count() * (g.num_symbols + 1)],
-        };
+        let num_symbols = g.num_symbols + /* eof */ 1;
+        let mut entries = Vec::new();
+        let mut table = vec![0; num_symbols * states.node_count()];
+        let mut entry_indices = HashMap::new();
+        let mut row = vec![SmallVec::<[_; 1]>::new(); num_symbols - g.nonterminals.len()];
         for (i, state) in states.node_references() {
-            for e in states.edges(i) {
-                let symbol = *e.weight();
-                if symbol == EOF {
-                    continue;
-                }
-                let actions = &mut table[(i.index(), symbol)];
-                actions.push(Action::Shift {
-                    goto: e.target().index(),
-                });
-            }
-
             // Given a final A-item for production P (A != S'), fill
             // corresponding row with reduce action for P.
             for item in state
@@ -494,14 +472,29 @@ impl<'grammar> Table<'grammar> {
                 .filter(|item| item.production.lhs != S_PRIME)
             {
                 for s in lookahead(i, item.production) {
-                    let actions = &mut table[(i.index(), s)];
-                    let new_action = Action::Reduce {
+                    let actions = &mut row[s as usize - g.nonterminals.len()];
+                    let action = Action::Reduce {
                         production: item.production,
                         count: item.cursor,
                     };
-                    if !actions.contains(&new_action) {
-                        actions.push(new_action);
+                    if !actions.contains(&action) {
+                        actions.push(action);
                     }
+                }
+            }
+
+            for e in states.edges(i) {
+                let symbol = *e.weight();
+                if symbol == EOF {
+                    continue;
+                }
+                if g.is_nonterminal(symbol) {
+                    table[num_symbols * i.index() + symbol as usize] = e.target().index() as u16;
+                } else {
+                    let actions = &mut row[symbol as usize - g.nonterminals.len()];
+                    actions.push(Action::Shift {
+                        goto: e.target().index(),
+                    });
                 }
             }
 
@@ -511,16 +504,111 @@ impl<'grammar> Table<'grammar> {
                 .iter()
                 .any(|item| item.production.lhs == S_PRIME && item.next_symbol() == Some(EOF))
             {
-                table[(i.index(), eof)].push(Action::Accept);
+                row[eof as usize - g.nonterminals.len()].push(Action::Accept);
+            }
+
+            // If S ⇒* ε, set accept in eof column in the start state.
+            if i.index() == START_STATE && nullable(0) {
+                row[eof as usize - g.nonterminals.len()].push(Action::Accept);
+            }
+
+            for (t, actions) in row
+                .iter_mut()
+                .enumerate()
+                .map(|(i, x)| (g.nonterminals.len() + i, x))
+            {
+                // TODO Use RawEntryBuilderMut::from_hash instead of smallvec once stable
+                let idx = *entry_indices
+                    .entry(mem::take(actions))
+                    .or_insert_with_key(|actions| {
+                        let idx = entries.len();
+                        entries.reserve(1 + actions.len());
+                        entries.push(TableEntry {
+                            count: actions.len(),
+                        });
+                        entries.extend(actions.iter().map(|&action| TableEntry { action }));
+                        idx
+                    });
+                table[num_symbols * i.index() + t] = idx as u16;
+            }
+
+            row.iter_mut().for_each(SmallVec::clear);
+        }
+
+        Self {
+            grammar: g,
+            entries,
+            table,
+        }
+    }
+
+    pub fn get(&self, state: StateId, symbol: Symbol) -> Actions<'grammar, '_> {
+        let i = self.table[(self.grammar.num_symbols + 1) * state + symbol as usize] as usize;
+        Actions(if self.grammar.is_nonterminal(symbol) {
+            ActionsInner::Shift(Some(i))
+        } else {
+            // Safety: Table is constructed such that each cell index
+            // points at entry with count followed by that many
+            // actions.
+            let count = unsafe { self.entries[i].count };
+            let actions = &self.entries[i + 1..][..count];
+            ActionsInner::Entries(actions)
+        })
+    }
+}
+
+impl<'grammar> fmt::Debug for Table<'grammar> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let num_symbols = self.grammar.num_symbols + 1;
+        let num_states = self.table.len() / num_symbols;
+        f.debug_list()
+            .entries((0..num_states).flat_map(|state| {
+                (0..num_symbols as Symbol).map(move |symbol| self.get(state, symbol))
+            }))
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct Actions<'grammar, 'a>(ActionsInner<'grammar, 'a>);
+
+#[derive(Clone, Copy)]
+enum ActionsInner<'grammar, 'a> {
+    Shift(Option<StateId>),
+    /// Slice of parse actions for a table cell.
+    ///
+    /// All entries have to be the [TableEntry::Action] variant.
+    Entries(&'a [TableEntry<'grammar>]),
+}
+
+impl<'grammar, 'a> Iterator for Actions<'grammar, 'a> {
+    type Item = Action<'grammar>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            ActionsInner::Shift(x) => x.map(|goto| Action::Shift { goto }).take(),
+            ActionsInner::Entries(xs) => {
+                let (entry, rest) = xs.split_first()?;
+                *xs = rest;
+                // Safety: The slice is always constructed above to only contain actions.
+                Some(unsafe { entry.action })
             }
         }
+    }
 
-        // If S ⇒* ε, set accept in eof column in the start state.
-        if nullable(0) {
-            table[(START_STATE, eof)].push(Action::Accept);
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self.0 {
+            ActionsInner::Shift(x) => x.into_iter().size_hint(),
+            ActionsInner::Entries(x) => x.iter().size_hint(),
         }
+    }
+}
 
-        table
+impl<'grammar, 'a> ExactSizeIterator for Actions<'grammar, 'a> {}
+
+impl<'grammar, 'a> fmt::Debug for Actions<'grammar, 'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
     }
 }
 
@@ -554,8 +642,8 @@ mod tests {
         };
         let table = Table::new(&grammar);
         assert_eq!(
-            table[(START_STATE, 1)],
-            &[Action::Reduce {
+            table.get(START_STATE, 1).collect::<Vec<_>>(),
+            [Action::Reduce {
                 production: Production { lhs: 0, rhs: &[] },
                 count: 0
             }]
