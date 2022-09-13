@@ -5,6 +5,10 @@ GLR parser in Rust.
 [![crates.io](https://img.shields.io/crates/v/glr.svg)](https://crates.io/crates/glr)
 [![docs.rs](https://img.shields.io/docsrs/glr)](https://docs.rs/glr)
 
+This crate is most useful when parsers need to be generated at runtime
+from context-free grammars that depend on user input. In other cases,
+the [LALRPOP] crate is likely to be more suitable.
+
 ## Example
 
 This example shows building a parser for the grammar
@@ -42,3 +46,5 @@ assert_eq!(family[2][1], root);
 
 Any one of the infinitely many derivation trees can be recovered by
 unwinding the cycles the right number of times.
+
+[LALRPOP]: https://github.com/lalrpop/lalrpop

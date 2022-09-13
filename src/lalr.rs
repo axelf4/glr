@@ -11,6 +11,7 @@ use smallvec::SmallVec;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::iter::FusedIterator;
 use std::{fmt, mem};
 
 use crate::bit_set::BitSet;
@@ -605,6 +606,8 @@ impl<'grammar, 'a> Iterator for Actions<'grammar, 'a> {
 }
 
 impl<'grammar, 'a> ExactSizeIterator for Actions<'grammar, 'a> {}
+
+impl<'grammar, 'a> FusedIterator for Actions<'grammar, 'a> {}
 
 impl<'grammar, 'a> fmt::Debug for Actions<'grammar, 'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
