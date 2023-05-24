@@ -51,8 +51,8 @@ use petgraph::{
     graph::{self, EdgeIndex, NodeIndex},
     Graph,
 };
-use std::iter;
-use std::{collections::HashMap, rc::Rc};
+use std::collections::{hash_map, HashMap};
+use std::{iter, rc::Rc};
 
 mod bit_set;
 pub mod lalr;
@@ -388,15 +388,18 @@ impl<'grammar, SA: SemanticAction<'grammar>> Parser<'grammar, SA> {
                 //     z_data.family.push(children);
                 // }
 
-                let sppf_node3 = sppf_node.clone();
-                self.recent_sppf_nodes
-                    .entry(SppfLabel {
-                        symbol: production.lhs,
-                        generation: self.gss.generation_of(u),
-                    })
-                    .and_modify(|sppf_node2| self.action.merge(sppf_node2, sppf_node))
-                    .or_insert(sppf_node3)
-                    .clone()
+                match self.recent_sppf_nodes.entry(SppfLabel {
+                    symbol: production.lhs,
+                    generation: self.gss.generation_of(u),
+                }) {
+                    hash_map::Entry::Occupied(x) => {
+                        let sppf_node2 = x.into_mut();
+                        self.action.merge(sppf_node2, sppf_node);
+                        sppf_node2
+                    }
+                    hash_map::Entry::Vacant(x) => x.insert(sppf_node),
+                }
+                .clone()
             };
 
             // Push a new node w
