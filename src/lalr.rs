@@ -5,19 +5,56 @@ See: DEREMER, Frank; PENNELLO, Thomas. Efficient computation of
      LALR (1) look-ahead sets. ACM Transactions on Programming
      Languages and Systems (TOPLAS), 1982, 4.4: 615-649.
 */
+use hashbrown::{HashMap, HashSet};
 use petgraph::visit::{EdgeRef as _, IntoNodeReferences as _};
 use petgraph::{graph::NodeIndex, Graph};
-use smallvec::SmallVec;
 use std::cmp::min;
-use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
+use std::fmt;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::iter::FusedIterator;
-use std::{fmt, mem};
 
 use crate::bit_set::BitSet;
 use crate::{Grammar, Production, Symbol};
 
 const S_PRIME: Symbol = u16::MAX;
+
+impl Grammar<'_> {
+    /// Computes the nullable nonterminals and first sets.
+    fn nullable_and_first_sets(&self) -> (impl Fn(Symbol) -> bool, Vec<BitSet>) {
+        let mut first_sets = vec![BitSet::new(); self.nonterminals.len()];
+        let mut nullables = BitSet::new();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut result = BitSet::new();
+            for production in self.productions() {
+                let mut is_nullable = true;
+                for &symbol in production.rhs {
+                    if self.is_nonterminal(symbol) {
+                        is_nullable &= nullables.contains(symbol.into());
+                        result |= &first_sets[symbol as usize];
+                    } else {
+                        is_nullable = false;
+                        result.insert(symbol.into());
+                    }
+                    if !is_nullable {
+                        break;
+                    }
+                }
+
+                if is_nullable && !nullables.contains(production.lhs.into()) {
+                    changed = true;
+                    nullables.insert(production.lhs.into());
+                } else {
+                    changed |= !result.is_subset(&first_sets[production.lhs as usize]);
+                }
+                first_sets[production.lhs as usize] |= &result;
+                result.clear();
+            }
+        }
+        (move |x: Symbol| nullables.contains(x.into()), first_sets)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Item<'grammar> {
@@ -36,8 +73,8 @@ impl<'grammar> Item<'grammar> {
             (
                 s,
                 Item {
-                    production: self.production,
                     cursor: self.cursor + 1,
+                    ..*self
                 },
             )
         })
@@ -218,19 +255,18 @@ where
         Active(usize),
         FoundScc,
     }
-    use Mark::*;
 
     fn traverse<R, I>(r: &R, stack: &mut Vec<usize>, f: &mut [BitSet], n: &mut [Mark], x: usize)
     where
         R: Fn(usize) -> I,
         I: IntoIterator<Item = usize>,
     {
-        if n[x] != Unmarked {
+        if n[x] != Mark::Unmarked {
             return;
         }
         stack.push(x);
         let depth = stack.len();
-        n[x] = Active(depth);
+        n[x] = Mark::Active(depth);
 
         for y in r(x) {
             if y == x {
@@ -248,13 +284,13 @@ where
             }
         }
 
-        if n[x] == Active(depth) {
+        if n[x] == Mark::Active(depth) {
             loop {
                 let z = stack.pop().unwrap();
                 if z == x {
                     break;
                 }
-                n[z] = FoundScc;
+                n[z] = Mark::FoundScc;
                 f[z] = f[x].clone();
             }
         }
@@ -262,7 +298,7 @@ where
 
     let mut f = fp; // Initialize F x to F' x
     let mut stack = Vec::new();
-    let mut n = vec![Unmarked; xs_len];
+    let mut n = vec![Mark::Unmarked; xs_len];
     for x in 0..xs_len {
         traverse(&r, &mut stack, f.as_mut(), &mut n, x);
     }
@@ -270,15 +306,15 @@ where
 }
 
 /// LR state index.
-pub type StateId = usize;
+pub type StateIdx = usize;
 /// The index of the LR parser start state.
-pub const START_STATE: StateId = 0;
+pub const START_STATE: StateIdx = 0;
 
 /// LR parse action.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Action<'grammar> {
     Shift {
-        goto: StateId,
+        goto: StateIdx,
     },
     Reduce {
         production: Production<'grammar>,
@@ -302,59 +338,10 @@ pub struct Table<'grammar> {
 impl<'grammar> Table<'grammar> {
     /// Builds a new parse table from the given grammar.
     pub fn new(g: &'grammar Grammar) -> Self {
-        let Lr0Dfa { states, .. } = Lr0Dfa::new(g);
+        let Lr0Dfa { states } = Lr0Dfa::new(g);
         let eof: Symbol = g.num_symbols.try_into().expect("Too many symbols");
-
         // Build the LALR(1) lookahead sets from the LR(0) automata
-        let (nullable, first_sets) = {
-            // First sets for all nonterminals
-            let mut first_sets = vec![BitSet::new(); g.nonterminals.len()];
-            let mut nullables = BitSet::new();
-            let mut changed = true;
-            while changed {
-                changed = false;
-                let mut result = BitSet::new();
-                for production in g.productions() {
-                    let mut is_nullable = true;
-                    for &symbol in production.rhs {
-                        if g.is_nonterminal(symbol) {
-                            is_nullable &= nullables.contains(symbol.into());
-                            result |= &first_sets[symbol as usize];
-                        } else {
-                            is_nullable = false;
-                            result.insert(symbol.into());
-                        }
-                        if !is_nullable {
-                            break;
-                        }
-                    }
-
-                    if is_nullable && !nullables.contains(production.lhs.into()) {
-                        changed = true;
-                        nullables.insert(production.lhs.into());
-                    }
-                    let len = first_sets[production.lhs as usize].len();
-                    first_sets[production.lhs as usize] |= &result;
-                    changed |= first_sets[production.lhs as usize].len() != len;
-                    result.clear();
-                }
-            }
-
-            (move |x: Symbol| nullables.contains(x.into()), first_sets)
-        };
-        let add_first = |iter, out: &mut BitSet| {
-            for symbol in iter {
-                if g.is_nonterminal(symbol) {
-                    *out |= &first_sets[symbol as usize];
-                    if !nullable(symbol) {
-                        break;
-                    }
-                } else {
-                    out.insert(symbol.into());
-                    break;
-                }
-            }
-        };
+        let (nullable, first_sets) = g.nullable_and_first_sets();
 
         #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
         struct Transition {
@@ -389,7 +376,6 @@ impl<'grammar> Table<'grammar> {
             symbol: 0,
         }]]
             .insert(eof.into());
-
         // (p, A) INCLUDES (p', B) iff B -> L A T,  T =>* eps, and p' --L-> p
         let mut includes = vec![BitSet::new(); xs.len()];
         // (q, A -> w) LOOKBACK (p, A) iff p --w-> q
@@ -409,10 +395,17 @@ impl<'grammar> Table<'grammar> {
                         state: p,
                         symbol: a,
                     }) {
-                        add_first(
-                            item.production.rhs[cursor + 1..].iter().copied(),
-                            &mut read[y],
-                        );
+                        for &symbol in &item.production.rhs[cursor + 1..] {
+                            if g.is_nonterminal(symbol) {
+                                read[y] |= &first_sets[symbol as usize];
+                                if !nullable(symbol) {
+                                    break;
+                                }
+                            } else {
+                                read[y].insert(symbol.into());
+                                break;
+                            }
+                        }
 
                         if item.production.rhs[cursor + 1..]
                             .iter()
@@ -457,10 +450,10 @@ impl<'grammar> Table<'grammar> {
 
         // Build the parse table
         let num_symbols = g.num_symbols + /* eof */ 1;
-        let mut entries = Vec::new();
-        let mut table = vec![0; num_symbols * states.node_count()];
+        let mut entries: Vec<TableEntry<'grammar>> = Vec::new();
         let mut entry_indices = HashMap::new();
-        let mut row = vec![SmallVec::<[_; 1]>::new(); num_symbols - g.nonterminals.len()];
+        let mut table = vec![0; num_symbols * states.node_count()];
+        let mut row = vec![Vec::new(); num_symbols - g.nonterminals.len()];
         for (i, state) in states.node_references() {
             // Given a final A-item for production P (A != S'), fill
             // corresponding row with reduce action for P.
@@ -498,24 +491,47 @@ impl<'grammar> Table<'grammar> {
                 .item_set
                 .iter()
                 .any(|item| item.production.lhs == S_PRIME && item.cursor > 0)
-                // If S ⇒* ε, set accept in eof column in the start state.
+                // If S ⇒* ε, set accept in eof column in the start state
                 || i.index() == START_STATE && nullable(0)
             {
                 row[eof as usize - g.nonterminals.len()].push(Action::Accept);
             }
 
+            struct FixedHash<T>(u64, T);
+
+            impl<T> Hash for FixedHash<T> {
+                fn hash<H: Hasher>(&self, state: &mut H) {
+                    state.write_u64(self.0);
+                }
+            }
+
             for (t, actions) in row.iter_mut().enumerate() {
-                // TODO Use RawEntryBuilderMut::from_hash instead of smallvec once stable
-                let idx = *entry_indices
-                    .entry(mem::take(actions))
-                    .or_insert_with_key(|actions| {
+                let hash = {
+                    let mut s = entry_indices.hasher().build_hasher();
+                    actions.hash(&mut s);
+                    s.finish()
+                };
+                let hash2 = {
+                    let mut s = entry_indices.hasher().build_hasher();
+                    s.write_u64(hash);
+                    s.finish()
+                };
+                let (&mut FixedHash(_, idx), _) = entry_indices
+                    .raw_entry_mut()
+                    .from_hash(hash2, |&FixedHash(_, k): &FixedHash<usize>| {
+                        entries[k + 1..][..unsafe { entries[k].count }]
+                            .iter()
+                            .map(|x| unsafe { &x.action })
+                            .eq(actions.iter())
+                    })
+                    .or_insert_with(|| {
                         let idx = entries.len();
                         entries.reserve(1 + actions.len());
                         entries.push(TableEntry {
                             count: actions.len(),
                         });
                         entries.extend(actions.iter().map(|&action| TableEntry { action }));
-                        idx
+                        (FixedHash(hash, idx), ())
                     });
                 table[num_symbols * i.index() + g.nonterminals.len() + t] = idx as u16;
                 actions.clear();
@@ -529,7 +545,7 @@ impl<'grammar> Table<'grammar> {
         }
     }
 
-    pub fn get(&self, state: StateId, symbol: Symbol) -> Actions<'grammar, '_> {
+    pub fn get(&self, state: StateIdx, symbol: Symbol) -> Actions<'grammar, '_> {
         let i = self.table[(self.grammar.num_symbols + 1) * state + symbol as usize] as usize;
         Actions(if self.grammar.is_nonterminal(symbol) {
             ActionsInner::Shift(Some(i))
@@ -558,7 +574,7 @@ impl<'grammar> fmt::Debug for Table<'grammar> {
 
 #[derive(Clone, Copy)]
 enum ActionsInner<'grammar, 'a> {
-    Shift(Option<StateId>),
+    Shift(Option<StateIdx>),
     /// Slice of parse actions for a table cell.
     ///
     /// All entries have to be the [TableEntry::Action] variant.
@@ -591,11 +607,11 @@ impl<'grammar, 'a> Iterator for Actions<'grammar, 'a> {
     }
 }
 
-impl<'grammar, 'a> ExactSizeIterator for Actions<'grammar, 'a> {}
+impl ExactSizeIterator for Actions<'_, '_> {}
 
-impl<'grammar, 'a> FusedIterator for Actions<'grammar, 'a> {}
+impl FusedIterator for Actions<'_, '_> {}
 
-impl<'grammar, 'a> fmt::Debug for Actions<'grammar, 'a> {
+impl fmt::Debug for Actions<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }

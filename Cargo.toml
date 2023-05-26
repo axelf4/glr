@@ -11,5 +11,5 @@ keywords = ["parser", "LR", "grammar"]
 categories = ["parsing"]
 
 [dependencies]
-petgraph = { version = "0.6.0", default-features = false }
-smallvec = { version = "1.9.0", features = ["union"] }
+hashbrown = "0.12"
+petgraph = { version = "0.6", default-features = false }

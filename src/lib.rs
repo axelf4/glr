@@ -46,7 +46,6 @@ See: SCOTT, Elizabeth; JOHNSTONE, Adrian. Right nulled GLR
 */
 
 #![deny(missing_debug_implementations)]
-#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 
 use petgraph::{
     graph::{self, EdgeIndex, NodeIndex},
@@ -89,7 +88,7 @@ impl<'a> Grammar<'a> {
     }
 
     fn productions(&'a self) -> impl Iterator<Item = Production<'a>> {
-        (0..self.nonterminals.len() as u16).flat_map(|x| self.productions_for(x).unwrap())
+        (0..self.nonterminals.len() as Symbol).flat_map(|x| self.productions_for(x).unwrap())
     }
 }
 
@@ -178,7 +177,7 @@ struct SppfLabel {
 
 #[derive(Debug)]
 struct GssNode {
-    state: lalr::StateId,
+    state: lalr::StateIdx,
 }
 
 /// Graph structured stack.
@@ -186,7 +185,7 @@ struct GssNode {
 struct Gss<'grammar> {
     g: Graph<GssNode, SppfNode<'grammar>>,
     /// The nodes of the current generation.
-    head: HashMap<lalr::StateId, NodeIndex>,
+    head: HashMap<lalr::StateIdx, NodeIndex>,
     /// The number of nodes in each completed generation.
     generation_counts: Vec<usize>,
 }
@@ -272,7 +271,7 @@ impl<'grammar> Gss<'grammar> {
         }
     }
 
-    fn add_node(&mut self, state: lalr::StateId) -> NodeIndex {
+    fn add_node(&mut self, state: lalr::StateIdx) -> NodeIndex {
         let v = self.g.add_node(GssNode { state });
         self.head.insert(state, v);
         v
@@ -298,7 +297,7 @@ struct Shift {
     /// GSS node to which the shift is to be applied.
     node: NodeIndex,
     /// Label of the GSS node which must be created as the parent of `node`.
-    goto: lalr::StateId,
+    goto: lalr::StateIdx,
 }
 
 /// GLR parser.

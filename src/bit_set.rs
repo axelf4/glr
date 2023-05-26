@@ -33,6 +33,14 @@ impl BitSet {
     pub fn iter(&self) -> Iter<iter::Copied<slice::Iter<u32>>> {
         Iter::new(self.0.iter().copied())
     }
+
+    pub fn is_subset(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .copied()
+            .zip(other.0.iter().copied().chain(iter::repeat(0)))
+            .all(|(a, b)| a & b == a)
+    }
 }
 
 impl BitOrAssign<&Self> for BitSet {
