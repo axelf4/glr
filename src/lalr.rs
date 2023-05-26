@@ -17,8 +17,7 @@ use std::{fmt, mem};
 use crate::bit_set::BitSet;
 use crate::{Grammar, Production, Symbol};
 
-const S_PRIME: Symbol = u16::MAX - 1;
-const EOF: Symbol = u16::MAX;
+const S_PRIME: Symbol = u16::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Item<'grammar> {
@@ -53,9 +52,9 @@ impl fmt::Display for Item<'_> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "{} →", self.production.lhs)?;
         let (before, after) = self.production.rhs.split_at(self.cursor);
-        before.iter().try_for_each(|t| write!(fmt, " {}", t))?;
+        before.iter().try_for_each(|t| write!(fmt, " {t}"))?;
         write!(fmt, " •")?;
-        after.iter().try_for_each(|t| write!(fmt, " {}", t))
+        after.iter().try_for_each(|t| write!(fmt, " {t}"))
     }
 }
 
@@ -69,20 +68,20 @@ impl<'grammar> ItemSet<'grammar> {
         let mut i = 0;
         while let Some(&item) = self.0.get(i) {
             // If the cursor is just left of some nonterminal N
-            match item.next_symbol() {
-                Some(n) if g.is_nonterminal(n) => {
-                    // Add initial items for all N-productions
-                    for production in g.productions_for(n).unwrap() {
-                        let new_item = Item {
-                            production,
-                            cursor: 0,
-                        };
-                        if set.insert(new_item) {
-                            self.0.push(new_item);
-                        }
-                    }
+            for production in item
+                .next_symbol()
+                .and_then(|n| g.productions_for(n))
+                .into_iter()
+                .flatten()
+            {
+                // Add initial items for all N-productions
+                let new_item = Item {
+                    production,
+                    cursor: 0,
+                };
+                if set.insert(new_item) {
+                    self.0.push(new_item);
                 }
-                _ => {}
             }
             i += 1;
         }
@@ -138,7 +137,7 @@ impl<'grammar> Lr0Dfa<'grammar> {
         let kernel0 = Kernel::start(vec![Item {
             production: Production {
                 lhs: S_PRIME,
-                rhs: &[0, EOF],
+                rhs: &[0],
             },
             cursor: 0,
         }]);
@@ -221,14 +220,6 @@ where
     }
     use Mark::*;
 
-    let mut f = fp; // Initialize F x to F' x
-    let mut stack = Vec::new();
-    let mut n = vec![Unmarked; xs_len];
-
-    for x in 0..xs_len {
-        traverse(&r, &mut stack, f.as_mut(), &mut n, x);
-    }
-
     fn traverse<R, I>(r: &R, stack: &mut Vec<usize>, f: &mut [BitSet], n: &mut [Mark], x: usize)
     where
         R: Fn(usize) -> I,
@@ -269,6 +260,12 @@ where
         }
     }
 
+    let mut f = fp; // Initialize F x to F' x
+    let mut stack = Vec::new();
+    let mut n = vec![Unmarked; xs_len];
+    for x in 0..xs_len {
+        traverse(&r, &mut stack, f.as_mut(), &mut n, x);
+    }
     f
 }
 
@@ -305,14 +302,13 @@ pub struct Table<'grammar> {
 impl<'grammar> Table<'grammar> {
     /// Builds a new parse table from the given grammar.
     pub fn new(g: &'grammar Grammar) -> Self {
-        assert!(g.num_symbols <= u16::MAX.into(), "too many symbols");
         let Lr0Dfa { states, .. } = Lr0Dfa::new(g);
-        let eof = g.num_symbols as Symbol;
+        let eof: Symbol = g.num_symbols.try_into().expect("Too many symbols");
 
         // Build the LALR(1) lookahead sets from the LR(0) automata
-        let (nullable, nt_first) = {
+        let (nullable, first_sets) = {
             // First sets for all nonterminals
-            let mut nt_first = vec![BitSet::new(); g.nonterminals.len()];
+            let mut first_sets = vec![BitSet::new(); g.nonterminals.len()];
             let mut nullables = BitSet::new();
             let mut changed = true;
             while changed {
@@ -323,7 +319,7 @@ impl<'grammar> Table<'grammar> {
                     for &symbol in production.rhs {
                         if g.is_nonterminal(symbol) {
                             is_nullable &= nullables.contains(symbol.into());
-                            result |= &nt_first[symbol as usize];
+                            result |= &first_sets[symbol as usize];
                         } else {
                             is_nullable = false;
                             result.insert(symbol.into());
@@ -337,19 +333,19 @@ impl<'grammar> Table<'grammar> {
                         changed = true;
                         nullables.insert(production.lhs.into());
                     }
-                    let len = nt_first[production.lhs as usize].len();
-                    nt_first[production.lhs as usize] |= &result;
-                    changed |= nt_first[production.lhs as usize].len() != len;
+                    let len = first_sets[production.lhs as usize].len();
+                    first_sets[production.lhs as usize] |= &result;
+                    changed |= first_sets[production.lhs as usize].len() != len;
                     result.clear();
                 }
             }
 
-            (move |x: Symbol| nullables.contains(x.into()), nt_first)
+            (move |x: Symbol| nullables.contains(x.into()), first_sets)
         };
         let add_first = |iter, out: &mut BitSet| {
             for symbol in iter {
                 if g.is_nonterminal(symbol) {
-                    *out |= &nt_first[symbol as usize];
+                    *out |= &first_sets[symbol as usize];
                     if !nullable(symbol) {
                         break;
                     }
@@ -383,9 +379,10 @@ impl<'grammar> Table<'grammar> {
             .collect();
 
         // Read(p, A) are the terminals that can be read before any
-        // phrase including A is reduced. Compute using first sets as
-        // in: IVES, Fred. Unifying view of recent LALR (1) lookahead
-        // set algorithms. ACM SIGPLAN Notices, 1986, 21.7: 131-135.
+        // phrase including A is reduced. Compute using first sets.
+        //
+        // See: IVES, Fred. Unifying view of recent LALR (1) lookahead
+        //      set algorithms. ACM SIGPLAN Notices, 1986, 21.7: 131-135.
         let mut read = vec![BitSet::new(); xs.len()];
         read[xs[&Transition {
             state: NodeIndex::new(START_STATE),
@@ -486,9 +483,6 @@ impl<'grammar> Table<'grammar> {
 
             for e in states.edges(i) {
                 let symbol = *e.weight();
-                if symbol == EOF {
-                    continue;
-                }
                 if g.is_nonterminal(symbol) {
                     table[num_symbols * i.index() + symbol as usize] = e.target().index() as u16;
                 } else {
@@ -503,21 +497,14 @@ impl<'grammar> Table<'grammar> {
             if state
                 .item_set
                 .iter()
-                .any(|item| item.production.lhs == S_PRIME && item.next_symbol() == Some(EOF))
+                .any(|item| item.production.lhs == S_PRIME && item.cursor > 0)
+                // If S ⇒* ε, set accept in eof column in the start state.
+                || i.index() == START_STATE && nullable(0)
             {
                 row[eof as usize - g.nonterminals.len()].push(Action::Accept);
             }
 
-            // If S ⇒* ε, set accept in eof column in the start state.
-            if i.index() == START_STATE && nullable(0) {
-                row[eof as usize - g.nonterminals.len()].push(Action::Accept);
-            }
-
-            for (t, actions) in row
-                .iter_mut()
-                .enumerate()
-                .map(|(i, x)| (g.nonterminals.len() + i, x))
-            {
+            for (t, actions) in row.iter_mut().enumerate() {
                 // TODO Use RawEntryBuilderMut::from_hash instead of smallvec once stable
                 let idx = *entry_indices
                     .entry(mem::take(actions))
@@ -530,10 +517,9 @@ impl<'grammar> Table<'grammar> {
                         entries.extend(actions.iter().map(|&action| TableEntry { action }));
                         idx
                     });
-                table[num_symbols * i.index() + t] = idx as u16;
+                table[num_symbols * i.index() + g.nonterminals.len() + t] = idx as u16;
+                actions.clear();
             }
-
-            row.iter_mut().for_each(SmallVec::clear);
         }
 
         Self {
@@ -570,9 +556,6 @@ impl<'grammar> fmt::Debug for Table<'grammar> {
     }
 }
 
-#[derive(Clone)]
-pub struct Actions<'grammar, 'a>(ActionsInner<'grammar, 'a>);
-
 #[derive(Clone, Copy)]
 enum ActionsInner<'grammar, 'a> {
     Shift(Option<StateId>),
@@ -582,12 +565,15 @@ enum ActionsInner<'grammar, 'a> {
     Entries(&'a [TableEntry<'grammar>]),
 }
 
+#[derive(Clone)]
+pub struct Actions<'grammar, 'a>(ActionsInner<'grammar, 'a>);
+
 impl<'grammar, 'a> Iterator for Actions<'grammar, 'a> {
     type Item = Action<'grammar>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.0 {
-            ActionsInner::Shift(x) => x.map(|goto| Action::Shift { goto }).take(),
+            ActionsInner::Shift(x) => x.take().map(|goto| Action::Shift { goto }),
             ActionsInner::Entries(xs) => {
                 let (entry, rest) = xs.split_first()?;
                 *xs = rest;
