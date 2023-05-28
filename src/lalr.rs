@@ -553,8 +553,7 @@ impl<'grammar> Table<'grammar> {
             // Safety: Table is constructed such that each cell index
             // points at entry with count followed by that many
             // actions.
-            let count = unsafe { self.entries[i].count };
-            let actions = &self.entries[i + 1..][..count];
+            let actions = &self.entries[i + 1..][..unsafe { self.entries[i].count }];
             ActionsInner::Entries(actions)
         })
     }
